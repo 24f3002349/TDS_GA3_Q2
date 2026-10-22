@@ -14,18 +14,20 @@ and executes only ACCEPTED proposals. It keeps durable, idempotent task state in
 
 | Provider | `LLM_BASE_URL` | `LLM_MODEL` |
 |---|---|---|
-| Google Gemini (free tier) | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.5-flash` |
+| Google Gemini (free tier) | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash` |
 | AI Pipe (IITM) | `https://aipipe.org/openai/v1` | `gpt-4.1-mini` |
 | OpenRouter | `https://openrouter.ai/api/v1` | any model |
 | Ollama (local) | `http://localhost:11434/v1` | e.g. `qwen2.5:14b` |
 
-If the model is unreachable, the agent falls back to a keyword heuristic so the protocol keeps working. Fallback
-decisions are much less accurate and are never cached.
+`LLM_MODEL` can be a comma-separated list. When a model answers 404 (retired), 429 (quota used up) or 5xx
+(overloaded), the agent tries the next model. Free-tier Gemini quotas are per model and small (for example 20
+requests per day), so list several. Only if every model fails does the agent fall back to a keyword heuristic;
+fallback decisions are much less accurate, are never cached, and log `[decide] FALLBACK used for package ...`.
 
 ## 2. Run locally and expose over public HTTPS (Cloudflare quick tunnel)
 
 ```powershell
-$env:LLM_API_KEY="..."; $env:LLM_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai"; $env:LLM_MODEL="gemini-2.5-flash"; $env:LLM_REASONING_EFFORT="low"; $env:PORT="8765"; python app.py
+$env:LLM_API_KEY="..."; $env:LLM_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai"; $env:LLM_MODEL="gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash"; $env:LLM_REASONING_EFFORT="low"; $env:PORT="8765"; python app.py
 ```
 
 In a second terminal (install once with `winget install Cloudflare.cloudflared`):
@@ -49,11 +51,13 @@ as Variables. Then submit that same URL.
 python test_contract.py https://<your-public-host>/a2a/
 ```
 
-Every line should say PASS. The self-test uses no grader checks.
+Every line should say PASS. The self-test uses no grader checks. `python test_decide.py` runs offline checks of the
+evidence and rationale validation.
 
 ## Knobs
 
 * `EVIDENCE_REF_BRACKETS=true` returns refs as `[REF]` instead of `REF`. Flip it only if the grader feedback reports evidence-format failures.
+* `LLM_FALLBACK_MODELS` is an optional extra comma-separated list appended to `LLM_MODEL`.
 * `LLM_CHUNK` sets how many packages go into one model call (default 6, so a 12-package core makes 2 parallel calls).
 * `REQUEST_BUDGET_S` sets the per-request time budget (default 40 s; the grader allows 45 s).
 * `ALLOWED_TOKENS` is an optional comma-separated allowlist. By default every bearer token is a separate principal.

@@ -1,6 +1,7 @@
 """Contract self-test. Usage: python test_contract.py [BASE_URL]   (default http://127.0.0.1:8000/a2a/)
 Uses synthetic packages only; costs no grader checks."""
 import asyncio
+import json
 import sys
 import uuid
 
@@ -91,11 +92,25 @@ async def main():
         check("bad version -> 400", r.status_code == 400, r.status_code)
         r = await c.post(url, content=b"{}", headers=H(**{"Content-Type": "text/plain"}))
         check("bad content-type -> 4xx", r.status_code in (400, 415), r.status_code)
+        r = await c.post(url, json=send_body(batch_message()), headers=H(**{"Content-Type": "application/json"}))
+        check("application/json body -> 415", r.status_code == 415, r.status_code)
+        check("415 error envelope", r.headers.get("content-type", "").startswith("application/problem+json")
+              and r.json()["error"]["details"][0]["reason"] == "CONTENT_TYPE_NOT_SUPPORTED", r.text[:300])
+        r = await c.post(url, json=send_body(batch_message()), headers={"Content-Type": "application/json"})
+        check("auth checked before media type", r.status_code == 401 and "www-authenticate" in r.headers, r.status_code)
+        r = await c.post(url, json=send_body(batch_message()), headers={k: v for k, v in H().items() if k != "A2A-Version"})
+        check("missing version -> 400", r.status_code == 400 and "VERSION_NOT_SUPPORTED" in r.text, r.status_code)
+        r = await c.get(BASE + "tasks", headers=H(**{"A2A-Version": "1.0.1"}))
+        check("patch version 1.0.1 accepted", r.status_code == 200, r.status_code)
+        r = await c.get(BASE + f"tasks/{uuid.uuid4()}", headers=H())
+        check("404 error envelope", r.status_code == 404 and r.json()["error"]["details"][0]["reason"] == "TASK_NOT_FOUND",
+              r.text[:300])
 
         # concurrent equivalent sends: reordered keys + changed returnImmediately
         msg = batch_message()
         bodies = [send_body(msg), send_body(reorder(msg), ri=True), send_body(msg), send_body(reorder(msg))]
-        rs = await asyncio.gather(*(c.post(url, json=b, headers=H()) for b in bodies))
+        hdrs = [H(), H(**{"Content-Type": "application/a2a+json; charset=utf-8"}), H(), H()]
+        rs = await asyncio.gather(*(c.post(url, json=b, headers=h) for b, h in zip(bodies, hdrs)))
         check("concurrent sends 200", all(x.status_code == 200 for x in rs), [x.status_code for x in rs])
         check("send media type", rs[0].headers["content-type"].startswith("application/a2a+json"))
         tasks = [x.json()["task"] for x in rs]
@@ -105,10 +120,17 @@ async def main():
         check("history keeps initial", task["history"][0]["messageId"] == msg["messageId"])
         parts = [p for a in task.get("artifacts", []) for p in a["parts"]]
         check("one proposals part, no receipt", [p["mediaType"] for p in parts] == [MT_PROPOSALS], parts)
+        expected = {"PKG-1": "settle_invoice", "PKG-2": "request_approval", "PKG-3": "reject_duplicate"}
         for p in parts[0]["data"]["proposals"]:
             print("   ", p["packageId"], p["action"], p["evidenceRefs"], p["facts"])
+            print("     ", p["rationale"])
             check(f"rationale len {p['packageId']}", 60 <= len(p["rationale"]) <= 1500)
             check(f"actionId len {p['packageId']}", len(p["actionId"]) >= 12)
+            check(f"action {p['packageId']}", p["action"] == expected[p["packageId"]], p["action"])
+            pkg_text = json.dumps(next(k for k in PACKAGES if k["packageId"] == p["packageId"]))
+            refs = [r.strip("[]") for r in p["evidenceRefs"]]
+            check(f"evidence IDs exist {p['packageId']}", refs and all(f"[{r}]" in pkg_text for r in refs), refs)
+            check(f"rationale cites evidence {p['packageId']}", all(r in p["rationale"] for r in refs))
 
         changed = dict(msg, parts=[{"mediaType": MT_BATCH, "data": {"batchId": "other", "packages": PACKAGES}}])
         r = await c.post(url, json=send_body(changed), headers=H())
@@ -117,6 +139,8 @@ async def main():
         # isolation
         r = await c.get(BASE + f"tasks/{task['id']}", headers=H(TOKEN_B))
         check("outsider get 403/404", r.status_code in (403, 404) and task["id"] not in r.text, r.status_code)
+        r = await c.post(BASE + f"tasks/{task['id']}:cancel", content=b'{}', headers=H(**{"Content-Type": "application/json"}))
+        check("cancel with application/json body -> 415", r.status_code == 415, r.status_code)
         r = await c.post(BASE + f"tasks/{task['id']}:cancel", headers=H(TOKEN_B))
         check("outsider cancel 403/404", r.status_code in (403, 404), r.status_code)
         r = await c.post(url, json={"message": results_message(task)}, headers=H(TOKEN_B))

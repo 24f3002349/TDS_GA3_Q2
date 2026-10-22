@@ -72,7 +72,13 @@ class A2AError(Exception):
         self.status, self.code, self.title, self.detail, self.extra = status, code, title, detail, extra
 
 
+HTTP_STATUS_NAMES = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED", 404: "NOT_FOUND",
+                     405: "UNIMPLEMENTED", 406: "INVALID_ARGUMENT", 409: "FAILED_PRECONDITION",
+                     413: "INVALID_ARGUMENT", 415: "INVALID_ARGUMENT", 500: "INTERNAL"}
+
+
 def problem(e: A2AError) -> Response:
+    # RFC 9457 fields (spec section 6.4 example) plus the AIP-193 "error" object (spec section 11.6).
     body = {
         "type": f"https://a2a-protocol.org/errors/{e.code.lower().replace('_', '-')}",
         "title": e.title,
@@ -80,6 +86,14 @@ def problem(e: A2AError) -> Response:
         "detail": e.detail or e.title,
         "code": e.code,
         **e.extra,
+        "error": {
+            "code": e.status,
+            "status": HTTP_STATUS_NAMES.get(e.status, "UNKNOWN"),
+            "message": e.detail or e.title,
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": e.code,
+                         "domain": "a2a-protocol.org",
+                         "metadata": {k: json.dumps(v) if not isinstance(v, str) else v for k, v in e.extra.items()}}],
+        },
     }
     headers = {"WWW-Authenticate": 'Bearer realm="a2a"'} if e.status == 401 else None
     return Response(json.dumps(body).encode(), e.status, media_type="application/problem+json", headers=headers)
@@ -107,7 +121,8 @@ def principal_of(request: Request) -> str:
 
 def check_protocol(request: Request, has_body: bool):
     version = request.headers.get("a2a-version") or request.query_params.get("A2A-Version") or ""
-    if version.strip() != "1.0":
+    # Spec 3.6: only Major.Minor counts ("1.0.1" is 1.0); an empty value means 0.3.
+    if version.strip().split(".")[:2] != ["1", "0"]:
         raise A2AError(400, "VERSION_NOT_SUPPORTED", "Protocol Version Not Supported",
                        "This agent supports A2A-Version 1.0 only.", supportedVersions=["1.0"])
     accept = request.headers.get("accept", "")
@@ -116,10 +131,11 @@ def check_protocol(request: Request, has_body: bool):
         if not any(k in (MT_A2A, "application/json", "application/*", "*/*") for k in kinds):
             raise A2AError(406, "NOT_ACCEPTABLE", "Not Acceptable", "Responses use application/a2a+json.")
     if has_body:
+        # A2A POST bodies must be application/a2a+json (parameters such as charset are fine).
         ctype = request.headers.get("content-type", "").split(";")[0].strip().lower()
-        if ctype not in (MT_A2A, "application/json"):
+        if ctype != MT_A2A:
             raise A2AError(415, "CONTENT_TYPE_NOT_SUPPORTED", "Unsupported Media Type",
-                           "Send application/a2a+json.")
+                           f"Request bodies must use Content-Type {MT_A2A}.", supportedMediaTypes=[MT_A2A])
 
 
 async def read_json(request: Request):
@@ -136,7 +152,8 @@ def guarded(handler, has_body=False):
     async def endpoint(request: Request):
         try:
             principal = principal_of(request)
-            check_protocol(request, has_body)
+            # Any POST that actually carries a body (e.g. a cancel with a JSON body) is media-type checked too.
+            check_protocol(request, has_body or (request.method == "POST" and bool(await request.body())))
             return await handler(request, principal)
         except A2AError as e:
             return problem(e)
@@ -197,7 +214,7 @@ async def build_proposals(principal: str, task_id: str):
     batch = record["batch"]
     packages = batch["packages"]
     deadline = asyncio.get_running_loop().time() + REQUEST_BUDGET_S - 4
-    decisions = await decide.decide_packages(packages, deadline, store, batch.get("policyRevision"))
+    decisions = await decide.decide_packages(packages, deadline, store, decide.batch_context(batch))
     proposals = []
     for pkg, d in zip(packages, decisions):
         pid = decide.package_id(pkg)
@@ -424,6 +441,16 @@ async def list_tasks(request: Request, principal: str):
         tasks = [t for t in tasks if t["contextId"] == context_id]
     if state:
         tasks = [t for t in tasks if t["status"]["state"] == state]
+    after = request.query_params.get("statusTimestampAfter")
+    if after:
+        try:
+            cutoff = datetime.datetime.fromisoformat(after.replace("Z", "+00:00"))
+        except ValueError:
+            raise bad("statusTimestampAfter must be an ISO 8601 timestamp.")
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=datetime.timezone.utc)
+        tasks = [t for t in tasks
+                 if datetime.datetime.fromisoformat(t["status"]["timestamp"].replace("Z", "+00:00")) > cutoff]
     page, size = [], 200
     for t in tasks[offset:offset + page_size]:
         item = view(t, history_length, include_artifacts)
