@@ -15,6 +15,7 @@ and executes only ACCEPTED proposals. It keeps durable, idempotent task state in
 | Provider | `LLM_BASE_URL` | `LLM_MODEL` |
 |---|---|---|
 | Google Gemini (free tier) | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash` |
+| Groq (free tier) | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b,openai/gpt-oss-20b` (set `LLM_CHUNK=4`, `LLM_REASONING_EFFORT=low`) |
 | AI Pipe (IITM) | `https://aipipe.org/openai/v1` | `gpt-4.1-mini` |
 | OpenRouter | `https://openrouter.ai/api/v1` | any model |
 | Ollama (local) | `http://localhost:11434/v1` | e.g. `qwen2.5:14b` |
@@ -60,4 +61,20 @@ evidence and rationale validation.
 * `LLM_FALLBACK_MODELS` is an optional extra comma-separated list appended to `LLM_MODEL`.
 * `LLM_CHUNK` sets how many packages go into one model call (default 6, so a 12-package core makes 2 parallel calls).
 * `REQUEST_BUDGET_S` sets the per-request time budget (default 40 s; the grader allows 45 s).
+* `SETTLE_GUARD=off` disables the safety check that turns `settle_invoice` into another action when a live,
+  non-negated record shows a duplicate payment, a conflict, a pending verification, or a need for approval.
+* `AUDIT_MAX_PACKAGES` (default 8): batches this size or smaller get first use of the model.
+* `WARM_BUDGET_S` (default 240): after a fallback, how long the agent keeps trying the model in the background
+  so the next batch with the same package content is answered from the cache.
+
+## Diagnosing the model
+
+* `GET /healthz` shows each model's last outcome (HTTP code and provider message, never the key) and the cache size.
+* `python probe_model.py 4` sends one agent-shaped request using `.env` and prints the raw result.
+
+Groq's free tier allows 8,000 tokens per minute per model, and Groq counts the reserved `max_tokens` against that
+budget. A 12-package core is about 12k tokens, so the first verification (5 cores within 160 s) cannot be answered
+entirely by the model. Some packages fall back, and background warming caches them afterwards. Later Checks reuse the
+same core packages, so they are answered from the cache. The cache is in SQLite and is lost when the host restarts
+or redeploys, including when Render's free tier spins down after 15 idle minutes.
 * `ALLOWED_TOKENS` is an optional comma-separated allowlist. By default every bearer token is a separate principal.

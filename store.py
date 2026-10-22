@@ -79,6 +79,10 @@ class Store:
             row = self.db.execute("SELECT data FROM decisions WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def count_decisions(self) -> int:
+        with self.mu:
+            return self.db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+
     def put_decision(self, key: str, decision: dict):
         with self.mu:
             self.db.execute(

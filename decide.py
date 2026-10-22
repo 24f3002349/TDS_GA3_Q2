@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from decimal import Decimal, InvalidOperation
 
 import httpx
@@ -31,6 +32,9 @@ LLM_REASONING = os.environ.get("LLM_REASONING_EFFORT", "")  # e.g. low / medium;
 LLM_CHUNK = int(os.environ.get("LLM_CHUNK", "6"))
 LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "4"))
 KEEP_BRACKETS = os.environ.get("EVIDENCE_REF_BRACKETS", "false").lower() == "true"
+AUDIT_MAX_PACKAGES = int(os.environ.get("AUDIT_MAX_PACKAGES", "8"))  # batches this small get model priority
+WARM_BUDGET_S = float(os.environ.get("WARM_BUDGET_S", "240"))
+SETTLE_GUARD = os.environ.get("SETTLE_GUARD", "on").lower() != "off"
 
 REF_RE = re.compile(r"\[([^\[\]\n]{1,120})\]")
 ID_KEY_RE = re.compile(r"^(id|ref|evidenceid|evidenceref|refid|docid|documentid|recordid|sourceid)$", re.I)
@@ -40,6 +44,15 @@ THREE_DECIMAL = {"KWD", "BHD", "OMR", "JOD", "TND", "LYD", "IQD"}
 _sem = None
 _pending: dict[str, asyncio.Future] = {}
 _cooldown: dict[str, float] = {}  # model -> loop time until which it is skipped
+MODEL_STATUS: dict[str, dict] = {}  # model -> last outcome (no secrets), shown on /healthz
+_warming: set = set()  # cache keys being decided in the background after a fallback
+_no_reasoning: set = set()  # models that rejected reasoning_effort
+# Free tiers are limited per model per minute (Groq: 8K tokens/min), so calls are spread round-robin over all
+# ready models, and when every model is cooling down the waiters are served by level:
+# 0 = small (audit) batch, 1 = core batch, 2 = background cache warming.
+LEVEL_AUDIT, LEVEL_CORE, LEVEL_WARM = 0, 1, 2
+_waiting = [0, 0, 0]
+_rr = 0
 
 SYSTEM_PROMPT = """You are an accounts-payable control agent. For EACH invoice package choose exactly one action,
 using only that package's own documents plus the batch context (policy revision, authority limits, currency rules).
@@ -267,8 +280,17 @@ def finalize(pkg: dict, d: dict) -> dict:
         refs = resolve_refs(pkg, h["decisiveRefs"])
         notes = {**evidence_notes(h), **notes}
         source = "fallback-refs"
+    facts = build_facts(pkg, d)
+    risk = risk_signal(pkg, facts["invoiceNumber"]) if action == "settle_invoice" and SETTLE_GUARD else None
+    if risk:  # never settle while a live record says duplicate / conflict / pending check / over authority
+        action, risk_refs, risk_text = risk
+        print(f"[decide] settle guard: {package_id(pkg)} -> {action}", flush=True)
+        if len(risk_refs) == 3:
+            refs, notes = risk_refs, {}
+        reason = (f'Safety check overrides settlement: a current record states "{clean(risk_text, 300).rstrip(".")}"')
+        source = source if source != "model" else "guard"
     out_refs = [f"[{r}]" for r in refs] if KEEP_BRACKETS else refs
-    return {"action": action, "evidenceRefs": out_refs, "facts": build_facts(pkg, d),
+    return {"action": action, "evidenceRefs": out_refs, "facts": facts,
             "rationale": rationale(action, reason, refs, notes), "source": source}
 
 
@@ -308,6 +330,29 @@ def heuristic(pkg: dict) -> dict:
                       "or held invoice, so the records need exception review"}
 
 
+RESOLVED = re.compile(r"\b(completed|cleared|resolved|released|lifted|satisfied|verified|passed|withdrawn|closed|"
+                      r"reversed|refunded|voided|cancell?ed)\b", re.I)
+
+
+def risk_signal(pkg: dict, invoice_number: str = ""):
+    """(action, refs, text) for the first live, non-negated, unresolved risk cue anywhere in the package's
+    non-noise text (any paragraph, not only 3-ref ones), checked in severity order; None if there is none.
+    A 'paid' record that names other invoices but not this one is not a duplicate signal."""
+    lines = [p for s in string_leaves(pkg) for p in re.split(r"\n+", s) if p.strip() and not NOISE.search(p)]
+    for action, cue in CUES[:-1]:
+        for text in lines:
+            if action == "reject_duplicate" and invoice_number and invoice_number.lower() not in text.lower() \
+                    and re.search(r"invoice\s*(no\.?|number|#)?\s*[:\-]?\s*[A-Z0-9][A-Z0-9\-/]*\d", text, re.I):
+                continue
+            for clause in re.split(r"[.;:!?](?:\s|$)", text):
+                for m in cue.finditer(clause):
+                    rest = clause[:m.start()] + " " + clause[m.end():]
+                    if not NEGATION.search(rest) and not RESOLVED.search(rest):
+                        refs = list(dict.fromkeys(r.strip() for r in REF_RE.findall(text)))
+                        return action, refs, text
+    return None
+
+
 def heuristic_facts(pkg: dict) -> dict:
     text = "\n".join(string_leaves(pkg))
     grab = lambda pat: (re.search(pat, text, re.I) or [None, None])[1]
@@ -326,66 +371,163 @@ def parse_json(text: str):
     return json.loads(text[start:end + 1])
 
 
-def cooldown_for(r: httpx.Response) -> float:
-    """How long to skip a model after an error response."""
-    if r.status_code == 404:
-        return 86400  # retired / unknown model id
+class TooLarge(Exception):
+    """The request exceeds the provider's per-request token limit: retry with fewer packages."""
+
+
+def retry_after(r: httpx.Response, default: float) -> float:
+    header = r.headers.get("retry-after", "")
+    if re.fullmatch(r"[\d.]+", header.strip()):
+        return min(300.0, float(header))
+    m = re.search(r"(?:retry|try again) in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s", r.text)
+    if m:
+        return min(300.0, int(m[1] or 0) * 3600 + int(m[2] or 0) * 60 + float(m[3]))
+    return default
+
+
+def classify(r: httpx.Response) -> tuple:
+    """(kind, seconds to skip the model) for an error response. Skips are short so one bad reply cannot
+    disable the model for long; the in-memory timer also resets on restart."""
+    body = r.text.lower()
+    if r.status_code == 413 or "request too large" in body or "reduce your message size" in body \
+            or "context_length" in body or "maximum context" in body:
+        return "too_large", 0
+    if r.status_code == 400 and ("json_validate_failed" in body or "failed to generate" in body
+                                 or "output_parse_failed" in body or "tool_use_failed" in body):
+        return "bad_json", 0
     if r.status_code == 429:
-        m = re.search(r"retry in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s", r.text)
-        if m:
-            return min(3600.0, int(m[1] or 0) * 3600 + int(m[2] or 0) * 60 + float(m[3]))
-        return 60
+        return "rate_limited", retry_after(r, 20)
     if r.status_code >= 500:
-        return 5
-    return 600  # other 4xx: this model rejects the request shape
+        return "overloaded", 3
+    if r.status_code in (401, 403):
+        return "auth", 120
+    if r.status_code == 404:
+        return "unknown_model", 300
+    return "rejected", 60
 
 
-async def call_model(packages: list, policy, deadline: float) -> dict:
-    global _sem
-    _sem = _sem or asyncio.Semaphore(LLM_CONCURRENCY)
+def max_tokens_for(n: int):
+    raw = os.environ.get("LLM_MAX_TOKENS", "")
+    if raw == "0":
+        return None
+    # Groq counts the reserved max_tokens against the per-minute budget, so reserve only what replies use
+    # (measured: ~150-250 output tokens per package at reasoning_effort=low).
+    return int(raw) if raw else min(16000, 800 + 300 * n)
+
+
+def build_payload(packages: list, policy, json_mode: bool = True, reasoning: bool = True) -> dict:
     user = {"batchContext": policy, "packages": packages}
     payload = {
         "temperature": 0,
-        "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                      {"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
     }
-    if LLM_REASONING:
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    if LLM_REASONING and reasoning:
         payload["reasoning_effort"] = LLM_REASONING
+    if max_tokens_for(len(packages)):
+        payload["max_tokens"] = max_tokens_for(len(packages))
+    return payload
+
+
+def note(model: str, ok: bool, detail: str):
+    detail = detail.replace(LLM_API_KEY, "<key>") if LLM_API_KEY else detail
+    MODEL_STATUS[model] = {"ok": ok, "detail": clean(detail, 300), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+async def pick_model(level: int, deadline: float) -> str:
+    """Next ready model (round-robin). While every model cools down, wait if one frees up before the deadline;
+    lower levels go first when a model frees up."""
+    global _rr
     loop = asyncio.get_running_loop()
-    async with _sem:
-        async with httpx.AsyncClient() as client:
-            for attempt in range(1, 7):
-                remaining = deadline - loop.time()
-                if remaining < 3:
-                    raise TimeoutError("model deadline")
-                ready = [m for m in LLM_MODELS if _cooldown.get(m, 0) <= loop.time()]
-                if not ready:  # every model is cooling down: wait only if one frees up in time
-                    wake = min(_cooldown[m] for m in LLM_MODELS)
-                    if wake - loop.time() > remaining - 8:
-                        raise RuntimeError("all models unavailable (quota/overload): " + ", ".join(LLM_MODELS))
-                    await asyncio.sleep(max(0.0, wake - loop.time()))
-                    continue
-                model = ready[0]
-                try:
+    while True:
+        remaining = deadline - loop.time()
+        if remaining < 3:
+            raise TimeoutError("model deadline")
+        ready = [m for m in LLM_MODELS if _cooldown.get(m, 0) <= loop.time()]
+        if ready and not any(_waiting[:level]):
+            _rr += 1
+            return ready[_rr % len(ready)]
+        if not ready:
+            wake = min(_cooldown[m] for m in LLM_MODELS)
+            if wake - loop.time() > remaining - 8:
+                raise RuntimeError("all models cooling down: " + "; ".join(
+                    f"{m}: {MODEL_STATUS.get(m, {}).get('detail', '?')}" for m in LLM_MODELS))
+            pause = min(1.0, max(0.05, wake - loop.time()))
+        else:
+            pause = 0.3  # a more urgent caller is queued; let it take this model first
+        _waiting[level] += 1
+        try:
+            await asyncio.sleep(pause)
+        finally:
+            _waiting[level] -= 1
+
+
+async def call_model(packages: list, policy, deadline: float, level: int = LEVEL_CORE) -> dict:
+    global _sem
+    _sem = _sem or asyncio.Semaphore(LLM_CONCURRENCY)
+    json_mode = True
+    loop = asyncio.get_running_loop()
+    async with httpx.AsyncClient() as client:
+        for attempt in range(1, 9):
+            model = await pick_model(level, deadline)
+            try:
+                async with _sem:
+                    payload = build_payload(packages, policy, json_mode, model not in _no_reasoning)
                     r = await client.post(f"{LLM_BASE_URL}/chat/completions", json={**payload, "model": model},
-                                          timeout=remaining, headers={"Authorization": f"Bearer {LLM_API_KEY}"})
-                    if r.status_code >= 400:
-                        _cooldown[model] = loop.time() + cooldown_for(r)
-                        raise httpx.HTTPStatusError(f"HTTP {r.status_code}: {clean(r.text, 160)}",
-                                                    request=r.request, response=r)
-                    content = r.json()["choices"][0]["message"]["content"]
-                    data = parse_json(content)
-                    out = {str(d.get("packageId")): d for d in data.get("decisions", []) if isinstance(d, dict)}
-                    print(f"[decide] {model} answered {len(out)}/{len(packages)} package(s)", flush=True)
-                    return out
-                except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError) as e:
-                    print(f"[decide] {model} attempt {attempt} failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
-                    if attempt >= 6:
-                        raise
-                    if not isinstance(e, httpx.HTTPStatusError):  # timeout / bad JSON: brief pause, same order
-                        await asyncio.sleep(min(2 ** attempt, max(0.0, deadline - loop.time() - 3)))
+                                          timeout=max(3.0, deadline - loop.time()),
+                                          headers={"Authorization": f"Bearer {LLM_API_KEY}"})
+                if r.status_code >= 400:
+                    kind, skip = classify(r)
+                    note(model, False, f"HTTP {r.status_code} {kind}: {r.text}")
+                    if kind == "too_large" and len(packages) > 1:
+                        raise TooLarge(f"{model} HTTP {r.status_code} with {len(packages)} package(s)")
+                    if kind == "too_large":  # cannot take even one package (e.g. a tiny output-token limit)
+                        skip = 300
+                    if kind == "bad_json":
+                        json_mode = False  # provider-side JSON validation failed: parse the text ourselves
+                    if kind == "rejected" and "reasoning" in r.text.lower() and model not in _no_reasoning:
+                        _no_reasoning.add(model)  # e.g. a model that does not take reasoning_effort=low
+                        skip = 0
+                    _cooldown[model] = loop.time() + skip
+                    raise httpx.HTTPStatusError(f"HTTP {r.status_code} {kind}: {clean(r.text, 160)}",
+                                                request=r.request, response=r)
+                content = r.json()["choices"][0]["message"]["content"]
+                data = parse_json(content)
+                out = {str(d.get("packageId")): d for d in data.get("decisions", []) if isinstance(d, dict)}
+                note(model, True, f"answered {len(out)}/{len(packages)}")
+                print(f"[decide] {model} answered {len(out)}/{len(packages)} package(s)", flush=True)
+                return out
+            except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError) as e:
+                msg = f"{type(e).__name__}: {str(e)[:200]}"
+                if not isinstance(e, httpx.HTTPStatusError):
+                    note(model, False, msg)
+                    _cooldown[model] = loop.time() + 2  # timeout / unparseable reply: try another model
+                print(f"[decide] {model} attempt {attempt} failed: {msg}", flush=True)
+                if attempt >= 8:
+                    raise
     raise RuntimeError("model attempts exhausted")
+
+
+async def ask_model(packages: list, policy, deadline: float, level: int = LEVEL_CORE) -> dict:
+    """call_model, halving the batch whenever the provider says the request is too large."""
+    try:
+        return await call_model(packages, policy, deadline, level)
+    except TooLarge as e:
+        print(f"[decide] {e}; splitting", flush=True)
+        if len(packages) == 1:
+            raise
+        half = len(packages) // 2
+        parts = await asyncio.gather(ask_model(packages[:half], policy, deadline, level),
+                                     ask_model(packages[half:], policy, deadline, level), return_exceptions=True)
+        out = {}
+        for p in parts:
+            if isinstance(p, dict):
+                out.update(p)
+        if not out:
+            raise next(p for p in parts if isinstance(p, BaseException))
+        return out
 
 
 async def decide_packages(packages: list, deadline: float, store, policy=None) -> list:
@@ -404,22 +546,12 @@ async def decide_packages(packages: list, deadline: float, store, policy=None) -
             _pending[key] = loop.create_future()
             todo.append((i, key, pkg))
 
-    def answered(d):
-        return isinstance(d, dict) and d.get("action") in ACTIONS
+    # A small batch is the fresh audit batch: it cannot be cached ahead, so it is served first.
+    level = LEVEL_AUDIT if len(packages) <= AUDIT_MAX_PACKAGES else LEVEL_CORE
+    fell_back = []
 
     async def run_chunk(chunk):
-        raw, missing = {}, list(chunk)
-        for _ in range(2):  # one extra call for packages the model skipped, if time allows
-            if not LLM_API_KEY or not missing:
-                break
-            try:
-                raw.update(await call_model([p for _, _, p in missing], policy, deadline))
-            except Exception as e:
-                print(f"[decide] model failed for chunk: {type(e).__name__}: {str(e)[:200]}", flush=True)
-                break
-            missing = [c for c in missing if not answered(raw.get(str(package_id(c[2]))))]
-            if deadline - loop.time() < 12:
-                break
+        raw = await model_decisions(chunk, policy, deadline, level)
         for i, key, pkg in chunk:
             d = raw.get(str(package_id(pkg)))
             if answered(d):
@@ -429,6 +561,7 @@ async def decide_packages(packages: list, deadline: float, store, policy=None) -
             else:
                 print(f"[decide] FALLBACK used for package {package_id(pkg)}", flush=True)
                 final = finalize(pkg, {**heuristic_facts(pkg), **heuristic(pkg)})
+                fell_back.append((i, key, pkg))
             results[i] = final
             fut = _pending.pop(key, None)
             if fut and not fut.done():
@@ -447,4 +580,52 @@ async def decide_packages(packages: list, deadline: float, store, policy=None) -
             results[i] = await asyncio.wait_for(asyncio.shield(fut), max(1, deadline - loop.time()))
         except Exception:
             results[i] = finalize(packages[i], {**heuristic_facts(packages[i]), **heuristic(packages[i])})
+    if fell_back and LLM_API_KEY:
+        asyncio.ensure_future(warm(fell_back, policy, store))
     return results
+
+
+def answered(d) -> bool:
+    return isinstance(d, dict) and d.get("action") in ACTIONS
+
+
+async def model_decisions(chunk: list, policy, deadline: float, level: int) -> dict:
+    """Raw model decisions keyed by packageId; one extra call for packages the model skipped, if time allows."""
+    raw, missing = {}, list(chunk)
+    loop = asyncio.get_running_loop()
+    for _ in range(2):
+        if not LLM_API_KEY or not missing:
+            break
+        try:
+            raw.update(await ask_model([p for _, _, p in missing], policy, deadline, level))
+        except Exception as e:
+            print(f"[decide] model failed for chunk: {type(e).__name__}: {str(e)[:300]}", flush=True)
+            break
+        missing = [c for c in missing if not answered(raw.get(str(package_id(c[2]))))]
+        if deadline - loop.time() < 12:
+            break
+    return raw
+
+
+async def warm(items: list, policy, store):
+    """After a request had to fall back, keep asking the model (lowest priority) so the decision is cached
+    for the next batch with the same package content. The already-returned proposal is not changed."""
+    items = [it for it in items if it[1] not in _warming]
+    _warming.update(key for _, key, _ in items)
+    loop = asyncio.get_running_loop()
+    try:
+        for start in range(0, len(items), LLM_CHUNK):
+            chunk = items[start:start + LLM_CHUNK]
+            raw = await model_decisions(chunk, policy, loop.time() + WARM_BUDGET_S, LEVEL_WARM)
+            for _, key, pkg in chunk:
+                d = raw.get(str(package_id(pkg)))
+                if answered(d):
+                    final = finalize(pkg, d)
+                    if final["source"] == "model":
+                        store.put_decision(key, final)
+            print(f"[decide] background cache warm: {sum(answered(raw.get(str(package_id(p)))) for _, _, p in chunk)}"
+                  f"/{len(chunk)} decided", flush=True)
+    except Exception as e:
+        print(f"[decide] background cache warm stopped: {type(e).__name__}: {str(e)[:200]}", flush=True)
+    finally:
+        _warming.difference_update(key for _, key, _ in items)
