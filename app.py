@@ -239,7 +239,43 @@ async def build_proposals(principal: str, task_id: str):
         set_status(task, S_INPUT,
                    "Proposals ready. No action has been executed; send invoice-action-results to continue.")
         record["proposals"] = proposals
+        record["sources"] = {decide.package_id(pkg): d.get("source") for pkg, d in zip(packages, decisions)}
         store.save(principal, record)
+    diag(f"batch {batch['batchId']} packages={len(packages)} context={json.dumps(decide.batch_context(batch))[:300]}")
+    for p in proposals:
+        f = p["facts"]
+        diag(f"proposal batch={batch['batchId']} pkg={p['packageId']} action={p['action']} "
+             f"src={record['sources'].get(p['packageId'])} refs={p['evidenceRefs']} "
+             f"facts={f['vendorName']}|{f['invoiceNumber']}|{f['amountMinor']}|{f['currency']}")
+
+
+# --- diagnostics: server log only (never returned over the API), to compare our proposals with grader verdicts ---
+DIAG = os.environ.get("DIAG_LOG", "on").lower() != "off"
+DIAG_PKG_CHARS = int(os.environ.get("DIAG_PKG_CHARS", "6000"))
+
+
+def diag(line: str):
+    if DIAG:
+        print("[diag] " + line, flush=True)
+
+
+def diag_verdicts(record: dict, data: dict):
+    batch_id = record["batch"]["batchId"]
+    proposals = {p["packageId"]: p for p in record["proposals"]}
+    packages = {decide.package_id(p): p for p in record["batch"]["packages"]}
+    sources = record.get("sources", {})
+    results = data.get("results", [])
+    accepted = sum(r.get("outcome") == "ACCEPTED" for r in results)
+    diag(f"summary batch={batch_id} accepted={accepted}/{len(results)}")
+    for r in results:
+        pid = r.get("packageId")
+        p = proposals.get(pid, {})
+        diag(f"verdict batch={batch_id} pkg={pid} outcome={r.get('outcome')} ours={p.get('action')} "
+             f"src={sources.get(pid)}")
+        if r.get("outcome") != "ACCEPTED":
+            diag(f"rejected batch={batch_id} pkg={pid} rationale={p.get('rationale', '')[:400]!r}")
+            diag(f"rejected-package batch={batch_id} pkg={pid} "
+                 f"json={json.dumps(packages.get(pid), ensure_ascii=False)[:DIAG_PKG_CHARS]}")
 
 
 def ensure_job(principal: str, task_id: str) -> asyncio.Future:
@@ -375,6 +411,7 @@ async def continue_task(principal: str, message: dict, digest: str) -> Response:
         if data is None:
             raise bad(f"Expected a data part with mediaType {MT_RESULTS}.", "CONTENT_TYPE_NOT_SUPPORTED")
         executions = build_executions(record, data)
+        diag_verdicts(record, data)
         task["history"].append(message)
         task["artifacts"].append({
             "artifactId": "receipts-" + task_id,

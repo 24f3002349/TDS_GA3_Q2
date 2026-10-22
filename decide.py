@@ -18,7 +18,7 @@ from decimal import Decimal, InvalidOperation
 import httpx
 
 ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
-PROMPT_VERSION = "v6"  # bump whenever prompt or validation changes, so stale cached decisions are not reused
+PROMPT_VERSION = "v7"  # bump whenever prompt or validation changes, so stale cached decisions are not reused
 
 # OPENROUTER_API_KEY, when set, takes precedence over the generic LLM_* provider settings (one variable to switch).
 # An OpenRouter key ("sk-or-...") placed in LLM_API_KEY is recognised too: it only works on OpenRouter anyway.
@@ -112,7 +112,9 @@ Method - apply it the same way to every package, including layouts you have not 
    it. The documents are deliberately noisy. NOT controlling: cover sheets / transmittals, archived or historical
    cases, training, sample or illustrative material, templates, drafts, superseded or replaced policy text, and
    records about other invoices or vendors - even when they use strong words like "duplicate", "hold" or "approval".
-   When a later or amended record replaces an earlier one, the later record controls.
+   When a later or amended record replaces an earlier one, the later record controls. The batch context's
+   policyRevision names the policy in force: use authority limits and rules from that revision only, never from
+   other or older revisions quoted in the documents.
 2. Read for meaning, not keywords: watch NEGATION ("no duplicate was found", "is not pending", "does not exceed"),
    resolved items ("call-back completed", "mismatch cleared") and action words used in irrelevant contexts.
 3. Decide from the controlling facts in this order: already paid -> reject_duplicate; unresolved conflict between
@@ -291,18 +293,22 @@ def find_key(obj, names):
     return None
 
 
-def to_minor(amount_text, currency: str):
-    if amount_text is None:
-        return None
-    m = re.findall(r"\d[\d,'\s]*(?:\.\d+)?", str(amount_text))
-    if not m:
-        return None
-    try:
-        value = Decimal(re.sub(r"[,'\s]", "", m[-1]))
-    except InvalidOperation:
-        return None
+def minor_candidates(amount_text, currency: str) -> list:
+    """Every number in the text converted to minor units, in order of appearance."""
+    out = []
     exp = 0 if currency in ZERO_DECIMAL else 3 if currency in THREE_DECIMAL else 2
-    return int((value * (10 ** exp)).to_integral_value())
+    for num in re.findall(r"\d[\d,']*(?:\.\d+)?", str(amount_text or "")):
+        try:
+            out.append(int((Decimal(re.sub(r"[,']", "", num)) * (10 ** exp)).to_integral_value()))
+        except InvalidOperation:
+            pass
+    return out
+
+
+def to_minor(amount_text, currency: str):
+    """The first number in the amount text ("45,200.00 incl. 18% GST" -> 4520000), in minor units."""
+    found = minor_candidates(amount_text, currency)
+    return found[0] if found else None
 
 
 def build_facts(pkg: dict, d: dict) -> dict:
@@ -316,7 +322,10 @@ def build_facts(pkg: dict, d: dict) -> dict:
         llm_minor = d.get("amountMinor")
         if isinstance(llm_minor, str) and llm_minor.strip().isdigit():
             llm_minor = int(llm_minor.strip())
-        amount = parsed if parsed is not None else (llm_minor if isinstance(llm_minor, int) else 0)
+        if isinstance(llm_minor, int) and llm_minor in minor_candidates(d.get("amountText"), currency):
+            amount = llm_minor  # the model's minor amount agrees with a number it quoted: trust it
+        else:
+            amount = parsed if parsed is not None else (llm_minor if isinstance(llm_minor, int) else 0)
     return {"vendorName": str(vendor).strip(), "invoiceNumber": str(number).strip(),
             "amountMinor": int(amount), "currency": currency}
 
