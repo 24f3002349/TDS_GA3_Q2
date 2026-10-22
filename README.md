@@ -32,7 +32,7 @@ tries, in order:
 
 | Provider | `LLM_BASE_URL` | `LLM_MODEL` |
 |---|---|---|
-| Google Gemini (free tier) | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash` |
+| Google Gemini (free tier) | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash` (set `LLM_CHUNK=6`, `LLM_REASONING_EFFORT=low`). Calls alternate between the first two models, because each model has its own free quota. A daily-quota 429 benches that model for an hour; a 503 "high demand" retries on the other model. |
 | Groq (free tier) | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b,openai/gpt-oss-20b` (set `LLM_CHUNK=4`, `LLM_REASONING_EFFORT=low`) |
 | AI Pipe (IITM) | `https://aipipe.org/openai/v1` | `gpt-5-mini,gpt-4.1-mini` (set `LLM_CHUNK=12`; no per-minute cap, about 1 US cent per core) |
 | OpenRouter | `https://openrouter.ai/api/v1` | any model |

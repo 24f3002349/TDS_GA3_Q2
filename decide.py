@@ -58,13 +58,18 @@ if OPENROUTER_API_KEY and os.environ.get("OPENROUTER_FREE_FALLBACK", "on").lower
         LLM_MODELS.append(_free)
         LAST_RESORT.add(_free)
 LLM_CHUNK = int(os.environ.get("LLM_CHUNK", "4"))
-# Round-robin over models only where each model has its own small per-minute budget (Groq free tier).
+# Round-robin over models only where each model has its own small free-tier quota (Groq, Google AI Studio).
 SPREAD = os.environ.get("LLM_SPREAD", "auto").lower() in ("1", "true", "on") or (
-    os.environ.get("LLM_SPREAD", "auto").lower() == "auto" and "groq.com" in LLM_BASE_URL)
+    os.environ.get("LLM_SPREAD", "auto").lower() == "auto" and ("groq.com" in LLM_BASE_URL
+                                                                or "googleapis.com" in LLM_BASE_URL))
+# How many leading models share the load; later ones are only used when those are unavailable.
+SPREAD_TOP = int(os.environ.get("LLM_SPREAD_TOP", "2" if "googleapis.com" in LLM_BASE_URL else "0")) or None
 LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "16"))
 KEEP_BRACKETS = os.environ.get("EVIDENCE_REF_BRACKETS", "false").lower() == "true"
 AUDIT_MAX_PACKAGES = int(os.environ.get("AUDIT_MAX_PACKAGES", "8"))  # batches this small get model priority
 WARM_BUDGET_S = float(os.environ.get("WARM_BUDGET_S", "240"))
+# One stuck call (overloaded free tier) must not use up the whole request: give up and try another model.
+CALL_TIMEOUT_S = float(os.environ.get("LLM_CALL_TIMEOUT_S", "25"))
 SETTLE_GUARD = os.environ.get("SETTLE_GUARD", "on").lower() != "off"
 CACHEABLE = ("model", "guard", "noise-guard")  # deterministic results of a model answer; fallbacks are retried
 
@@ -491,6 +496,8 @@ def classify(r: httpx.Response) -> tuple:
     if r.status_code == 400 and ("json_validate_failed" in body or "failed to generate" in body
                                  or "output_parse_failed" in body or "tool_use_failed" in body):
         return "bad_json", 0
+    if r.status_code == 429 and re.search(r"per_?day|perday|daily", body):
+        return "daily_quota", 3600  # free daily quota used up for this model: stop asking it, use the others
     if r.status_code == 429:
         return "rate_limited", retry_after(r, 20)
     if r.status_code >= 500:
@@ -577,8 +584,9 @@ async def pick_model(level: int, deadline: float) -> str:
         if ready and not any(_waiting[:level]):
             if not SPREAD or (level == LEVEL_AUDIT and LLM_MODELS[0] in ready):
                 return ready[0]  # preference order; unseen audit cases always try the first-listed model first
+            pool = [m for m in ready if m in LLM_MODELS[:SPREAD_TOP]] or ready
             _rr += 1
-            return ready[_rr % len(ready)]
+            return pool[_rr % len(pool)]
         if not ready:
             wake = min(max(_cooldown.get(m, 0), now) for m in LLM_MODELS if m not in LAST_RESORT) \
                 if any(m not in LAST_RESORT for m in LLM_MODELS) else min(_cooldown[m] for m in LLM_MODELS)
@@ -610,7 +618,7 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
                 async with _sem:
                     payload = adapt(build_payload(packages, policy, json_mode, model not in _no_reasoning, base), model)
                     r = await client.post(f"{base}/chat/completions", json={**payload, **extra, "model": model},
-                                          timeout=max(3.0, deadline - loop.time()),
+                                          timeout=max(3.0, min(deadline - loop.time(), CALL_TIMEOUT_S)),
                                           headers={"Authorization": f"Bearer {key}"})
                 if r.status_code >= 400:
                     kind, skip = classify(r)

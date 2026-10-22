@@ -120,6 +120,9 @@ check("402 in-flight -> short wait", decide.classify(R(402, "This request would 
                                                           "your current in-flight requests."))[0] == "credit_busy"
       and decide.classify(R(402, "in-flight"))[1] <= 5)
 check("402 no credit -> skip paid model", decide.classify(R(402, "Insufficient credits"))[0] == "no_credit")
+check("gemini daily quota -> stop for an hour", decide.classify(R(429, '{"error":{"details":[{"violations":[{'
+      '"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}'))[0] == "daily_quota")
+check("gemini per-minute 429 waits retryDelay", decide.classify(R(429, "Please retry in 34.5s."))[1] == 34.5)
 check("404 skip <= 5 min", decide.classify(R(404, "model not found"))[1] <= 300)
 
 print("\nALL PASS" if not failures else f"\n{len(failures)} FAILURES: {failures}")
