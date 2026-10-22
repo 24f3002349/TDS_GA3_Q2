@@ -18,6 +18,18 @@ and executes only ACCEPTED proposals. It keeps durable, idempotent task state in
 Override the models with `OPENROUTER_MODEL`. A grader-scale run (5 cores × 12 packages plus an audit) takes about 10 s
 and costs about US$0.01–0.02, so keep a little credit on the account.
 
+**When credit runs out.** OpenRouter answers HTTP 402, and the agent skips the paid models for 15 minutes. It then
+tries, in order:
+
+1. An optional second provider: `FALLBACK_BASE_URL`, `FALLBACK_API_KEY` and `FALLBACK_MODEL`. For example, GitHub
+   Models (free with a GitHub token that has "Models: read" permission) uses `FALLBACK_BASE_URL=https://models.github.ai/inference`
+   and `FALLBACK_MODEL=openai/gpt-4.1-mini`.
+2. The free OpenRouter model `nvidia/nemotron-3-ultra-550b-a55b:free`, with thinking switched off. It scored 18/18
+   on `eval_decide.py`, but takes about 30 s per 4 packages and shares a rate-limited pool with every free user, so
+   it mostly fills the cache in the background. Set `OPENROUTER_FREE_FALLBACK=off` to disable it.
+
+`/healthz` lists each model with its provider host.
+
 | Provider | `LLM_BASE_URL` | `LLM_MODEL` |
 |---|---|---|
 | Google Gemini (free tier) | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash` |

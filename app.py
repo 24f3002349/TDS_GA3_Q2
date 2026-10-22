@@ -504,6 +504,7 @@ async def agent_card(request: Request):
 async def health(request: Request):
     """Liveness plus model diagnostics (no secrets): last outcome per model and the decision-cache size."""
     body = {"ok": True, "models": decide.LLM_MODELS, "keySet": bool(decide.LLM_API_KEY),
+            "providers": {m: e[0].split("/")[2] for m, e in decide.ENDPOINT.items()},
             "modelStatus": decide.MODEL_STATUS, "cachedDecisions": store.count_decisions(),
             "warming": len(decide._warming)}
     return Response(json.dumps(body).encode(), media_type="application/json")

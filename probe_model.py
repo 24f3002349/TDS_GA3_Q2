@@ -48,8 +48,9 @@ async def main():
     async with httpx.AsyncClient() as client:
         for model in decide.LLM_MODELS:
             t = time.time()
-            r = await client.post(f"{decide.LLM_BASE_URL}/chat/completions", json={**payload, "model": model},
-                                  timeout=60, headers={"Authorization": f"Bearer {decide.LLM_API_KEY}"})
+            base, key, extra = decide.ENDPOINT[model]
+            r = await client.post(f"{base}/chat/completions", json={**payload, **extra, "model": model},
+                                  timeout=120, headers={"Authorization": f"Bearer {key}"})
             print(f"\n{model}: HTTP {r.status_code} in {time.time() - t:.1f}s")
             if r.status_code >= 400:
                 print(redact(r.text[:800]))

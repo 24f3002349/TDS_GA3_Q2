@@ -40,6 +40,21 @@ else:
 # 429 (quota) or 5xx (overloaded) the next one is tried instead of falling back to keywords.
 LLM_MODELS = list(dict.fromkeys(
     m.strip() for m in f'{_models},{os.environ.get("LLM_FALLBACK_MODELS", "")}'.split(",") if m.strip()))
+# Where each model is served: model -> (base URL, API key, extra request fields). Order of LLM_MODELS is the
+# preference order: primary provider, then an optional second provider (FALLBACK_*), then a free OpenRouter model.
+ENDPOINT = {m: (LLM_BASE_URL, LLM_API_KEY, {}) for m in LLM_MODELS}
+_fb_key = os.environ.get("FALLBACK_API_KEY", "").strip()
+if _fb_key and os.environ.get("FALLBACK_BASE_URL"):
+    for m in (x.strip() for x in os.environ.get("FALLBACK_MODEL", "").split(",")):
+        if m and m not in ENDPOINT:
+            ENDPOINT[m] = (os.environ["FALLBACK_BASE_URL"].rstrip("/"), _fb_key, {})
+            LLM_MODELS.append(m)
+if OPENROUTER_API_KEY and os.environ.get("OPENROUTER_FREE_FALLBACK", "on").lower() != "off":
+    # Last resort when paid models are refused (402, no credit): accurate but slow, so thinking is switched off.
+    _free = os.environ.get("OPENROUTER_FREE_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+    if _free not in ENDPOINT:
+        ENDPOINT[_free] = (LLM_BASE_URL, LLM_API_KEY, {"reasoning": {"enabled": False}})
+        LLM_MODELS.append(_free)
 LLM_CHUNK = int(os.environ.get("LLM_CHUNK", "4"))
 # Round-robin over models only where each model has its own small per-minute budget (Groq free tier).
 SPREAD = os.environ.get("LLM_SPREAD", "auto").lower() in ("1", "true", "on") or (
@@ -464,6 +479,8 @@ def classify(r: httpx.Response) -> tuple:
     """(kind, seconds to skip the model) for an error response. Skips are short so one bad reply cannot
     disable the model for long; the in-memory timer also resets on restart."""
     body = r.text.lower()
+    if r.status_code == 402 or "insufficient credits" in body or "requires more credits" in body:
+        return "no_credit", 900  # paid model refused for lack of credit: use the next (free) model for a while
     if r.status_code == 413 or "request too large" in body or "reduce your message size" in body \
             or "context_length" in body or "maximum context" in body:
         return "too_large", 0
@@ -481,7 +498,7 @@ def classify(r: httpx.Response) -> tuple:
     return "rejected", 60
 
 
-def max_tokens_for(n: int):
+def max_tokens_for(n: int, base: str = LLM_BASE_URL):
     raw = os.environ.get("LLM_MAX_TOKENS", "")
     if raw == "0":
         return None
@@ -490,10 +507,11 @@ def max_tokens_for(n: int):
     # Elsewhere reasoning models (gpt-5*, o*) spend part of this budget thinking, so leave more headroom.
     if raw:
         return int(raw)
-    return min(16000, 800 + 300 * n) if "groq.com" in LLM_BASE_URL else min(32000, 3000 + 800 * n)
+    return min(16000, 800 + 300 * n) if "groq.com" in base else min(32000, 3000 + 800 * n)
 
 
-def build_payload(packages: list, policy, json_mode: bool = True, reasoning: bool = True) -> dict:
+def build_payload(packages: list, policy, json_mode: bool = True, reasoning: bool = True,
+                  base: str = LLM_BASE_URL) -> dict:
     user = {"batchContext": policy, "packages": packages}
     payload = {
         "temperature": 0,
@@ -504,8 +522,8 @@ def build_payload(packages: list, policy, json_mode: bool = True, reasoning: boo
         payload["response_format"] = {"type": "json_object"}
     if LLM_REASONING and reasoning:
         payload["reasoning_effort"] = LLM_REASONING
-    if max_tokens_for(len(packages)):
-        payload["max_tokens"] = max_tokens_for(len(packages))
+    if max_tokens_for(len(packages), base):
+        payload["max_tokens"] = max_tokens_for(len(packages), base)
     return payload
 
 
@@ -532,7 +550,8 @@ def adapt(payload: dict, model: str) -> dict:
 
 
 def note(model: str, ok: bool, detail: str):
-    detail = detail.replace(LLM_API_KEY, "<key>") if LLM_API_KEY else detail
+    for _, key, _ in ENDPOINT.values():
+        detail = detail.replace(key, "<key>") if key else detail
     MODEL_STATUS[model] = {"ok": ok, "detail": clean(detail, 300), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
@@ -575,11 +594,12 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
         for attempt in range(1, 9):
             model = await pick_model(level, deadline)
             try:
+                base, key, extra = ENDPOINT.get(model, (LLM_BASE_URL, LLM_API_KEY, {}))
                 async with _sem:
-                    payload = adapt(build_payload(packages, policy, json_mode, model not in _no_reasoning), model)
-                    r = await client.post(f"{LLM_BASE_URL}/chat/completions", json={**payload, "model": model},
+                    payload = adapt(build_payload(packages, policy, json_mode, model not in _no_reasoning, base), model)
+                    r = await client.post(f"{base}/chat/completions", json={**payload, **extra, "model": model},
                                           timeout=max(3.0, deadline - loop.time()),
-                                          headers={"Authorization": f"Bearer {LLM_API_KEY}"})
+                                          headers={"Authorization": f"Bearer {key}"})
                 if r.status_code >= 400:
                     kind, skip = classify(r)
                     note(model, False, f"HTTP {r.status_code} {kind}: {r.text}")
