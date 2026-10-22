@@ -18,7 +18,7 @@ from decimal import Decimal, InvalidOperation
 import httpx
 
 ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
-PROMPT_VERSION = "v7"  # bump whenever prompt or validation changes, so stale cached decisions are not reused
+PROMPT_VERSION = "v8"  # bump whenever prompt or validation changes, so stale cached decisions are not reused
 
 # OPENROUTER_API_KEY, when set, takes precedence over the generic LLM_* provider settings (one variable to switch).
 # An OpenRouter key ("sk-or-...") placed in LLM_API_KEY is recognised too: it only works on OpenRouter anyway.
@@ -71,7 +71,8 @@ WARM_BUDGET_S = float(os.environ.get("WARM_BUDGET_S", "240"))
 # One stuck call (overloaded free tier) must not use up the whole request: give up and try another model.
 CALL_TIMEOUT_S = float(os.environ.get("LLM_CALL_TIMEOUT_S", "25"))
 SETTLE_GUARD = os.environ.get("SETTLE_GUARD", "on").lower() != "off"
-CACHEABLE = ("model", "guard", "noise-guard")  # deterministic results of a model answer; fallbacks are retried
+# Deterministic results (model answers and confident case-reader decisions) are cached; weak fallbacks are retried.
+CACHEABLE = ("model", "guard", "noise-guard", "rules", "rules-override")
 
 REF_RE = re.compile(r"\[([^\[\]\n]{1,120})\]")
 ID_KEY_RE = re.compile(r"^(id|ref|evidenceid|evidenceref|refid|docid|documentid|recordid|sourceid)$", re.I)
@@ -360,6 +361,89 @@ def rationale(action: str, reason: str, refs: list, notes: dict) -> str:
     return " ".join(parts)[:1500]
 
 
+# --- case reader: deterministic reading of the case-file layout -------------------------------------------------
+# A case file states its facts on the cover sheet ("Supplier X; invoice Y; stated total CUR N") and has exactly one
+# decisive paragraph carrying three bracketed references; archive/training notes and the cover carry fewer.
+COVER_RE = re.compile(r"Supplier\s+(?P<vendor>[^;\n]+?)\s*;\s*invoice\s+(?P<inv>[^;\s]+)\s*;\s*stated total\s+"
+                      r"(?P<cur>[A-Z]{3})\s*(?P<amt>\d[\d,]*(?:\.\d+)?)", re.I)
+CASE_CUES = {
+    "reject_duplicate": [
+        r"already (been )?(paid|settled)", r"earlier (posting|settled|settlement|payment)", r"completed payment",
+        r"prior (ledger )?(transaction|payment|settlement) (closed|matches)", r"second (disbursement|settlement|payment)",
+        r"(exact|commercial) duplicate", r"requires? rejection|to rejection", r"(same|one) instrument",
+        r"another scan of the same", r"same commercial key"],
+    "open_exception": [
+        r"conflicts? with", r"beyond (the )?tolerance", r"outside the permitted [a-z ]*tolerance", r"does not reconcile",
+        r"incompatible", r"contradict", r"exception (queue|workflow|case|review)", r"no corrected (instrument|document)"],
+    "hold_invoice": [
+        r"call-?back", r"(verification|check)(?:[^.]|\.\d){0,90}?(has not|not yet|incomplete|pending|neither)", r"pauses? (release|payment)",
+        r"freez", r"until (that|the)(?:[^.]|\.\d){0,90}?(check|callback|verification)", r"beneficiary details",
+        r"(newly supplied|new|changed) (bank|destination)|account change|bank account", r"out-of-band",
+        r"known[- ](channel|number)"],
+    "request_approval": [
+        r"outside the operator'?s?(?:[^.]|\.\d){0,90}?authority", r"(exceeds?|above|beyond)(?:[^.]|\.\d){0,90}?(authority|ceiling|delegat|limit)",
+        r"below the stated total", r"(named|financial) (financial )?approver", r"approval workflow",
+        r"without escalation only up to", r"delegation (schedule|ceiling)"],
+    "settle_invoice": [
+        r"no prior (settlement|payment)", r"no paid item", r"no earlier posting", r"remains unpaid",
+        r"meets the settlement conditions", r"not the document now under review",
+        r"covers every billed unit|full quantity|invoiced quantity received", r"same payable total",
+        r"reconciled(?:[^.]|\.\d){0,90}?with no exception|agree within"],
+}
+CUE_NEGATED = re.compile(r"\b(no|not|never|without|nor)\s+(\w+\s+){0,2}$", re.I)
+
+
+def cue_scores(text: str) -> dict:
+    """Matches per action in one paragraph; a non-settle cue preceded by a negation ("no earlier posting") is ignored."""
+    scores = {}
+    for action, pats in CASE_CUES.items():
+        n = 0
+        for pat in pats:
+            for m in re.finditer(pat, text, re.I):
+                if action != "settle_invoice" and CUE_NEGATED.search(text[max(0, m.start() - 30):m.start()]):
+                    continue
+                n += 1
+                break
+        scores[action] = n
+    return scores
+
+
+def ref_sentences(text: str) -> dict:
+    """ref -> the sentence of the paragraph that cites it (what that evidence shows)."""
+    out = {}
+    for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z])", text):
+        for r in REF_RE.findall(sentence):
+            out.setdefault(r.strip().lower(), clean(REF_RE.sub("", sentence), 260).rstrip(" ."))
+    return out
+
+
+def read_case(pkg: dict):
+    """{action, confident, refs, notes, facts} read deterministically from the case file, or None."""
+    cover = None
+    for _, line in labeled_lines(pkg):
+        m = COVER_RE.search(line)
+        if m:
+            cover = m
+            break
+    facts = None
+    if cover:
+        cur = cover["cur"].upper()
+        facts = {"vendorName": cover["vendor"].strip(), "invoiceNumber": cover["inv"].strip().rstrip(".,"),
+                 "amountMinor": to_minor(cover["amt"], cur), "currency": cur}
+    paras = [(t, r) for t, r in paragraphs(pkg) if len(r) == 3 and not NOISE.search(t)]
+    if not paras:
+        return {"action": None, "confident": False, "refs": [], "notes": {}, "facts": facts, "text": ""}
+    scored = []
+    for text, refs in paras:
+        s = cue_scores(text)
+        ranked = sorted(s.items(), key=lambda kv: -kv[1])
+        scored.append((ranked[0][1], ranked[0][0], ranked[0][1] - ranked[1][1], text, refs))
+    best, action, margin, text, refs = max(scored, key=lambda x: (x[0], x[2]))
+    para = text.split(" | ", 1)[-1]
+    return {"action": action if best else None, "confident": best >= 2 and margin >= 1, "refs": refs,
+            "notes": ref_sentences(para), "facts": facts, "text": para}
+
+
 def finalize(pkg: dict, d: dict) -> dict:
     """Validated decision. 'source' records whether the model's refs survived validation."""
     action = d.get("action") if d.get("action") in ACTIONS else "open_exception"
@@ -367,6 +451,20 @@ def finalize(pkg: dict, d: dict) -> dict:
         e.get("ref") for e in d.get("evidence") or [] if isinstance(e, dict)]
     refs = resolve_refs(pkg, llm_refs)
     notes, reason, source = evidence_notes(d), d.get("reason"), d.get("source", "model")
+    case = read_case(pkg)
+    if case and case["confident"]:
+        # The case file names its own decisive paragraph and the wording of that paragraph fixes the action;
+        # the rationale quotes, for each cited ID, the sentence that shows it.
+        if source in ("fallback", "fallback-refs"):
+            source, reason = "rules", ""
+        elif action != case["action"]:
+            print(f"[decide] case reader: {package_id(pkg)} model {action} -> {case['action']}", flush=True)
+            source, reason = "rules-override", ""
+        action, refs, notes = case["action"], case["refs"], case["notes"]
+        facts = case["facts"] or build_facts(pkg, d)
+        out_refs = [f"[{r}]" for r in refs] if KEEP_BRACKETS else refs
+        return {"action": action, "evidenceRefs": out_refs, "facts": facts,
+                "rationale": rationale(action, reason, refs, notes), "source": source}
     if not refs:  # nothing the model cited exists in the package: cite the rule-based decisive paragraph instead
         h = heuristic(pkg)
         refs = resolve_refs(pkg, h["decisiveRefs"])
@@ -392,6 +490,8 @@ def finalize(pkg: dict, d: dict) -> dict:
             refs, notes = risk_refs, {}
         reason = (f'Safety check overrides settlement: a current record states "{clean(risk_text, 300).rstrip(".")}"')
         source = source if source != "model" else "guard"
+    if case and case["facts"]:
+        facts = case["facts"]  # the cover sheet states the controlling facts exactly
     out_refs = [f"[{r}]" for r in refs] if KEEP_BRACKETS else refs
     return {"action": action, "evidenceRefs": out_refs, "facts": facts,
             "rationale": rationale(action, reason, refs, notes), "source": source}
@@ -528,12 +628,35 @@ def max_tokens_for(n: int, base: str = LLM_BASE_URL):
     if raw:
         return int(raw)
     # OpenRouter also reserves credit for max_tokens on every in-flight request, so keep it modest there too.
-    return min(16000, 800 + 300 * n) if "groq.com" in base else min(32000, 1000 + 500 * n)
+    return min(16000, 800 + 300 * n) if "groq.com" in base else min(32000, 800 + 350 * n)
+
+
+def condense(pkg: dict) -> dict:
+    """The package as the model sees it: every document keeps only its paragraphs that carry a bracketed reference
+    (cover facts, the decisive record, archive/training notes). Case files are mostly filler ("The referenced office
+    was ...") so this cuts tokens ~5x, which keeps free-tier quotas and latency low. Packages without such
+    paragraphs are sent unchanged."""
+    if os.environ.get("LLM_CONDENSE", "on").lower() == "off":
+        return pkg
+
+    def shrink(o):
+        if isinstance(o, str):
+            paras = [p for p in re.split(r"\n\s*\n|\n", o) if REF_RE.search(p)]
+            return "\n\n".join(paras) if paras else ("" if len(o) > 200 else o)
+        if isinstance(o, dict):
+            return {k: shrink(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [shrink(v) for v in o]
+        return o
+
+    if not paragraphs(pkg):
+        return pkg
+    return shrink(pkg)
 
 
 def build_payload(packages: list, policy, json_mode: bool = True, reasoning: bool = True,
                   base: str = LLM_BASE_URL) -> dict:
-    user = {"batchContext": policy, "packages": packages}
+    user = {"batchContext": policy, "packages": [condense(p) for p in packages]}
     payload = {
         "temperature": 0,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT},
@@ -713,9 +836,12 @@ async def decide_packages(packages: list, deadline: float, store, policy=None) -
                 if final["source"] in CACHEABLE:
                     store.put_decision(key, final)  # only fully model-backed decisions are cached
             else:
-                print(f"[decide] FALLBACK used for package {package_id(pkg)}", flush=True)
                 final = finalize(pkg, {**heuristic_facts(pkg), **heuristic(pkg)})
-                fell_back.append((i, key, pkg))
+                if final["source"] in CACHEABLE:
+                    store.put_decision(key, final)  # the case reader decided it confidently without the model
+                else:
+                    print(f"[decide] FALLBACK used for package {package_id(pkg)}", flush=True)
+                    fell_back.append((i, key, pkg))
             results[i] = final
             fut = _pending.pop(key, None)
             if fut and not fut.done():
