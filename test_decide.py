@@ -116,6 +116,10 @@ class R:
 check("429 uses 'try again in'", decide.classify(R(429, "Please try again in 10.97s."))[1] == 10.97)
 check("413 -> split", decide.classify(R(413, "Request too large"))[0] == "too_large")
 check("groq json failure -> retry", decide.classify(R(400, '{"error":{"code":"json_validate_failed"}}')) == ("bad_json", 0))
+check("402 in-flight -> short wait", decide.classify(R(402, "This request would exceed your available credits given "
+                                                          "your current in-flight requests."))[0] == "credit_busy"
+      and decide.classify(R(402, "in-flight"))[1] <= 5)
+check("402 no credit -> skip paid model", decide.classify(R(402, "Insufficient credits"))[0] == "no_credit")
 check("404 skip <= 5 min", decide.classify(R(404, "model not found"))[1] <= 300)
 
 print("\nALL PASS" if not failures else f"\n{len(failures)} FAILURES: {failures}")

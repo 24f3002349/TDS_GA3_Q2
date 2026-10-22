@@ -43,6 +43,7 @@ LLM_MODELS = list(dict.fromkeys(
 # Where each model is served: model -> (base URL, API key, extra request fields). Order of LLM_MODELS is the
 # preference order: primary provider, then an optional second provider (FALLBACK_*), then a free OpenRouter model.
 ENDPOINT = {m: (LLM_BASE_URL, LLM_API_KEY, {}) for m in LLM_MODELS}
+LAST_RESORT: set = set()  # slow free models: skipped while a preferred model is only briefly unavailable
 _fb_key = os.environ.get("FALLBACK_API_KEY", "").strip()
 if _fb_key and os.environ.get("FALLBACK_BASE_URL"):
     for m in (x.strip() for x in os.environ.get("FALLBACK_MODEL", "").split(",")):
@@ -55,6 +56,7 @@ if OPENROUTER_API_KEY and os.environ.get("OPENROUTER_FREE_FALLBACK", "on").lower
     if _free not in ENDPOINT:
         ENDPOINT[_free] = (LLM_BASE_URL, LLM_API_KEY, {"reasoning": {"enabled": False}})
         LLM_MODELS.append(_free)
+        LAST_RESORT.add(_free)
 LLM_CHUNK = int(os.environ.get("LLM_CHUNK", "4"))
 # Round-robin over models only where each model has its own small per-minute budget (Groq free tier).
 SPREAD = os.environ.get("LLM_SPREAD", "auto").lower() in ("1", "true", "on") or (
@@ -479,6 +481,8 @@ def classify(r: httpx.Response) -> tuple:
     """(kind, seconds to skip the model) for an error response. Skips are short so one bad reply cannot
     disable the model for long; the in-memory timer also resets on restart."""
     body = r.text.lower()
+    if r.status_code == 402 and "in-flight" in body:
+        return "credit_busy", 3  # low balance: too many paid requests at once; retry the same model shortly
     if r.status_code == 402 or "insufficient credits" in body or "requires more credits" in body:
         return "no_credit", 900  # paid model refused for lack of credit: use the next (free) model for a while
     if r.status_code == 413 or "request too large" in body or "reduce your message size" in body \
@@ -507,7 +511,8 @@ def max_tokens_for(n: int, base: str = LLM_BASE_URL):
     # Elsewhere reasoning models (gpt-5*, o*) spend part of this budget thinking, so leave more headroom.
     if raw:
         return int(raw)
-    return min(16000, 800 + 300 * n) if "groq.com" in base else min(32000, 3000 + 800 * n)
+    # OpenRouter also reserves credit for max_tokens on every in-flight request, so keep it modest there too.
+    return min(16000, 800 + 300 * n) if "groq.com" in base else min(32000, 1000 + 500 * n)
 
 
 def build_payload(packages: list, policy, json_mode: bool = True, reasoning: bool = True,
@@ -564,14 +569,19 @@ async def pick_model(level: int, deadline: float) -> str:
         remaining = deadline - loop.time()
         if remaining < 3:
             raise TimeoutError("model deadline")
-        ready = [m for m in LLM_MODELS if _cooldown.get(m, 0) <= loop.time()]
+        now = loop.time()
+        ready = [m for m in LLM_MODELS if _cooldown.get(m, 0) <= now]
+        # A slow last-resort model is only worth it when no preferred model frees up within a few seconds.
+        if any(m not in LAST_RESORT and 0 < _cooldown.get(m, 0) - now <= 4 for m in LLM_MODELS):
+            ready = [m for m in ready if m not in LAST_RESORT]
         if ready and not any(_waiting[:level]):
             if not SPREAD or (level == LEVEL_AUDIT and LLM_MODELS[0] in ready):
                 return ready[0]  # preference order; unseen audit cases always try the first-listed model first
             _rr += 1
             return ready[_rr % len(ready)]
         if not ready:
-            wake = min(_cooldown[m] for m in LLM_MODELS)
+            wake = min(max(_cooldown.get(m, 0), now) for m in LLM_MODELS if m not in LAST_RESORT) \
+                if any(m not in LAST_RESORT for m in LLM_MODELS) else min(_cooldown[m] for m in LLM_MODELS)
             if wake - loop.time() > remaining - 8:
                 raise RuntimeError("all models cooling down: " + "; ".join(
                     f"{m}: {MODEL_STATUS.get(m, {}).get('detail', '?')}" for m in LLM_MODELS))
@@ -591,7 +601,9 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
     json_mode = True
     loop = asyncio.get_running_loop()
     async with httpx.AsyncClient() as client:
-        for attempt in range(1, 9):
+        attempt = 0
+        while True:  # ends on success, after 8 real failures, or at the deadline (pick_model raises)
+            attempt += 1
             model = await pick_model(level, deadline)
             try:
                 base, key, extra = ENDPOINT.get(model, (LLM_BASE_URL, LLM_API_KEY, {}))
@@ -614,6 +626,8 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
                         skip = 0
                     elif kind == "rejected" and learn_rejected_params(model, payload, r.text):
                         skip = 0  # retry at once without the parameter the model refused
+                    if kind == "credit_busy":
+                        attempt -= 1  # not a failure: wait for in-flight requests to finish (deadline still applies)
                     _cooldown[model] = loop.time() + skip
                     raise httpx.HTTPStatusError(f"HTTP {r.status_code} {kind}: {clean(r.text, 160)}",
                                                 request=r.request, response=r)
@@ -631,7 +645,6 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
                 print(f"[decide] {model} attempt {attempt} failed: {msg}", flush=True)
                 if attempt >= 8:
                     raise
-    raise RuntimeError("model attempts exhausted")
 
 
 async def ask_model(packages: list, policy, deadline: float, level: int = LEVEL_CORE) -> dict:
