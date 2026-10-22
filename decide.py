@@ -18,7 +18,7 @@ from decimal import Decimal, InvalidOperation
 import httpx
 
 ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v5"  # bump whenever prompt or validation changes, so stale cached decisions are not reused
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
@@ -181,14 +181,26 @@ def resolve_refs(pkg: dict, llm_refs) -> list:
         hit = canonical.get(r) or canonical.get(r.lower())
         if hit and hit not in valid:
             valid.append(hit)
-    best, best_score = None, (0, 0)
-    for _, refs in paras:
+    best, best_text, best_score = None, "", (0, 0)
+    for text, refs in paras:
         score = (len(set(refs) & set(valid)), -abs(len(refs) - 3))
         if score > best_score:
-            best, best_score = refs, score
-    if best and best_score[0] >= 2 and len(best) == 3:
+            best, best_text, best_score = refs, text, score
+    # The decisive paragraph carries three refs: complete it when the model cited two of them, or one of them
+    # from a non-noise paragraph (small models often cite only the policy ref).
+    if best and len(best) == 3 and (best_score[0] >= 2 or (best_score[0] == 1 and not NOISE.search(best_text))):
         return best
     return valid[:3]
+
+
+def cites_only_noise(pkg: dict, refs: list) -> bool:
+    """True when every cited ref occurs only in archive / training / cover-sheet style paragraphs."""
+    paras = paragraphs(pkg)
+    for r in refs:
+        homes = [text for text, prefs in paras if r in prefs]
+        if not homes or any(not NOISE.search(text) for text in homes):
+            return False
+    return bool(refs)
 
 
 def find_key(obj, names):
@@ -280,6 +292,17 @@ def finalize(pkg: dict, d: dict) -> dict:
         refs = resolve_refs(pkg, h["decisiveRefs"])
         notes = {**evidence_notes(h), **notes}
         source = "fallback-refs"
+    elif source == "model" and cites_only_noise(pkg, refs):
+        # The model based its choice on non-controlling material (e.g. an archived training example):
+        # decide again from the operative, non-noise records instead.
+        h = heuristic(pkg)
+        if h["decisiveRefs"]:
+            print(f"[decide] noise guard: {package_id(pkg)} cited only noise {refs}; "
+                  f"{action} -> {h['action']}", flush=True)
+            action, refs, notes = h["action"], resolve_refs(pkg, h["decisiveRefs"]), {}
+            reason = ("The model's cited records are archive, training or cover-sheet material, which does not control "
+                      f"this invoice; the operative record states \"{clean(h['controlling'], 300).rstrip('.')}\"")
+            source = "noise-guard"
     facts = build_facts(pkg, d)
     risk = risk_signal(pkg, facts["invoiceNumber"]) if action == "settle_invoice" and SETTLE_GUARD else None
     if risk:  # never settle while a live record says duplicate / conflict / pending check / over authority
@@ -320,12 +343,13 @@ def heuristic(pkg: dict) -> dict:
     for action, cue in CUES:
         for text, refs in reversed(candidates):
             if affirmed(cue, text):
-                return {"action": action, "decisiveRefs": refs, "source": "fallback",
+                return {"action": action, "decisiveRefs": refs, "source": "fallback", "controlling": text,
                         "evidence": [{"ref": r, "shows": "is cited in that record"} for r in refs],
                         "reason": f'Rule-based fallback (model unavailable): the controlling record states '
                                   f'"{clean(text, 300).rstrip(".")}"'}
     refs = candidates[-1][1] if candidates else []
     return {"action": "open_exception", "decisiveRefs": refs, "source": "fallback",
+            "controlling": candidates[-1][0] if candidates else "",
             "reason": "Rule-based fallback (model unavailable): no record clearly establishes a payable, approved "
                       "or held invoice, so the records need exception review"}
 

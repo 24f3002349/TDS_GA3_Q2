@@ -18,7 +18,9 @@ PKG = {"packageId": "P1", "documents": [
 
 # refs: exact package IDs only, snapped to the decisive paragraph, invented IDs dropped
 check("snap to decisive paragraph", decide.resolve_refs(PKG, ["BNK-4", "inv-4471"]) == ["BNK-4", "INV-4471", "CTL-9"])
-check("invented IDs dropped", decide.resolve_refs(PKG, ["FAKE-1", "[BNK-4]"]) == ["BNK-4"])
+check("invented IDs dropped, lone real ref completed to its paragraph",
+      decide.resolve_refs(PKG, ["FAKE-1", "[BNK-4]"]) == ["BNK-4", "INV-4471", "CTL-9"])
+check("lone cover-sheet ref not completed", decide.resolve_refs(PKG, ["CV-1"]) == ["CV-1"])
 check("structured id accepted", decide.resolve_refs(PKG, ["EV-7"]) == ["EV-7"])
 check("package id is not evidence", decide.resolve_refs(PKG, ["P1"]) == [])
 
@@ -63,6 +65,32 @@ for name, text in [("archive example", "Archived training example: invoice alrea
     check(f"guard: {name} keeps settle", g["action"] == "settle_invoice", (g["action"], g["rationale"]))
 g = decide.finalize(pkg("Bank-detail call-back is pending [BNK-2].", RECON), {**SETTLE, "action": "hold_invoice"})
 check("guard: non-settle untouched", g["action"] == "hold_invoice" and g["source"] == "model", g)
+
+# replays of real gpt-oss-20b answers to the contract-test packages
+PKG1 = pkg("Transmittal for review [CV-001] [CV-002] [CV-003].",
+           "Vendor: Acme Tools Pvt Ltd. Invoice INV-7781 for INR 45,200.00.",
+           "Archived training example: invoice was already paid twice [AR-1] [AR-2] [AR-3].",
+           "PO [PO-7781] and goods receipt [GRN-55] match invoice [INV-7781]; amount is within the autonomous limit "
+           "and fully reconciled.")
+g = decide.finalize(PKG1, {"action": "reject_duplicate", "decisiveRefs": ["AR-1", "AR-2", "AR-3"],
+                           "invoiceNumber": "INV-7781", "reason": "Archived records show it was paid."})
+check("noise guard: archive-based duplicate -> settle", g["action"] == "settle_invoice"
+      and g["evidenceRefs"] == ["PO-7781", "GRN-55", "INV-7781"] and g["source"] == "noise-guard", g)
+check("noise guard rationale cites refs", all(f"[{r}]" in g["rationale"] for r in g["evidenceRefs"]), g["rationale"])
+g = decide.finalize(PKG1, {"action": "settle_invoice", "decisiveRefs": ["PO-7781", "GRN-55", "INV-7781"],
+                           "invoiceNumber": "INV-7781"})
+check("correct 120b answer untouched", g["action"] == "settle_invoice" and g["source"] == "model", g)
+PKG2 = pkg("Vendor: Blue River Logistics. Invoice BRL-220 for INR 9,80,000.00.",
+           "The amount exceeds the delegated authority [POL-3.1]; PO [PO-220] and receipt [GRN-220] reconcile, so CFO "
+           "approval is required.")
+g = decide.finalize(PKG2, {"action": "request_approval", "decisiveRefs": ["POL-3.1"]})
+check("single ref completed to three", g["action"] == "request_approval"
+      and g["evidenceRefs"] == ["POL-3.1", "PO-220", "GRN-220"], g)
+PKG3 = pkg("Vendor: Zen Paper Co. Invoice ZP-9 for INR 12,000.00.",
+           "Invoice ZP-9 was already paid on 2026-03-01 under payment [PAY-9] matching ledger [LED-9] and remittance "
+           "[REM-9].")
+g = decide.finalize(PKG3, {"action": "reject_duplicate", "decisiveRefs": ["PAY-9", "LED-9", "REM-9"]})
+check("real duplicate untouched", g["action"] == "reject_duplicate" and g["source"] == "model", g)
 
 # error classification: Groq TPM 429 waits only the advertised time; nothing disables a model for a day
 class R:
