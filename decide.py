@@ -27,7 +27,9 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip() or (
 if OPENROUTER_API_KEY:
     LLM_BASE_URL = "https://openrouter.ai/api/v1"
     LLM_API_KEY = OPENROUTER_API_KEY
-    _models = os.environ.get("OPENROUTER_MODEL") or "anthropic/claude-haiku-5.5,openai/gpt-6-luna"
+    _models = (os.environ.get("OPENROUTER_MODEL")
+               or (os.environ.get("LLM_MODEL") if "openrouter.ai" in os.environ.get("LLM_BASE_URL", "") else "")
+               or "anthropic/claude-haiku-5.5,openai/gpt-6-luna")
     LLM_REASONING = os.environ.get("OPENROUTER_REASONING_EFFORT", "")
 else:
     LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
