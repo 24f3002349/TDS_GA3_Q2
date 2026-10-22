@@ -12,11 +12,17 @@ and executes only ACCEPTED proposals. It keeps durable, idempotent task state in
 
 ## 1. Configure a model (any OpenAI-compatible endpoint)
 
+**Recommended: OpenRouter.** Set one variable, `OPENROUTER_API_KEY=sk-or-...`. An OpenRouter key placed in
+`LLM_API_KEY` is also recognised. Either way the agent uses `https://openrouter.ai/api/v1` with
+`anthropic/claude-haiku-5.5`, falling back to `openai/gpt-6-luna`, and ignores the other `LLM_*` provider settings.
+Override the models with `OPENROUTER_MODEL`. A grader-scale run (5 cores × 12 packages plus an audit) takes about 10 s
+and costs about US$0.01–0.02, so keep a little credit on the account.
+
 | Provider | `LLM_BASE_URL` | `LLM_MODEL` |
 |---|---|---|
 | Google Gemini (free tier) | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash` |
 | Groq (free tier) | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b,openai/gpt-oss-20b` (set `LLM_CHUNK=4`, `LLM_REASONING_EFFORT=low`) |
-| AI Pipe (IITM) | `https://aipipe.org/openai/v1` | `gpt-4.1-mini` |
+| AI Pipe (IITM) | `https://aipipe.org/openai/v1` | `gpt-5-mini,gpt-4.1-mini` (set `LLM_CHUNK=12`; no per-minute cap, about 1 US cent per core) |
 | OpenRouter | `https://openrouter.ai/api/v1` | any model |
 | Ollama (local) | `http://localhost:11434/v1` | e.g. `qwen2.5:14b` |
 
@@ -53,7 +59,10 @@ python test_contract.py https://<your-public-host>/a2a/
 ```
 
 Every line should say PASS. The self-test uses no grader checks. `python test_decide.py` runs offline checks of the
-evidence and rationale validation.
+evidence and rationale validation. `python eval_decide.py --model` scores the configured model on 18 synthetic
+packages built like the grader's: archive and training decoys, negation, payments for other invoices, completed
+checks, superseded limits, and action words in names. It prints any wrong action, evidence or facts, and the number
+of unsafe settles. Without `--model` it scores the keyword fallback.
 
 ## Knobs
 

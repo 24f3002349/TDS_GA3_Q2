@@ -11,6 +11,9 @@ if os.path.exists(".env"):
         k, sep, v = line.strip().partition("=")
         if sep and not k.startswith("#"):
             os.environ.setdefault(k.strip(), v.strip())
+if "--groq" in sys.argv:  # ignore OPENROUTER_API_KEY and probe the LLM_* (e.g. Groq) settings instead
+    os.environ.pop("OPENROUTER_API_KEY", None)
+    sys.argv.remove("--groq")
 
 import httpx  # noqa: E402
 

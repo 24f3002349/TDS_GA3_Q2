@@ -18,23 +18,36 @@ from decimal import Decimal, InvalidOperation
 import httpx
 
 ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
-PROMPT_VERSION = "v5"  # bump whenever prompt or validation changes, so stale cached decisions are not reused
+PROMPT_VERSION = "v6"  # bump whenever prompt or validation changes, so stale cached decisions are not reused
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-# LLM_MODEL may be a comma-separated preference list; LLM_FALLBACK_MODELS is appended. When a model answers
-# 404 (retired), 429 (quota) or 5xx (overloaded) the next one is tried instead of falling back to keywords.
-DEFAULT_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash"
+# OPENROUTER_API_KEY, when set, takes precedence over the generic LLM_* provider settings (one variable to switch).
+# An OpenRouter key ("sk-or-...") placed in LLM_API_KEY is recognised too: it only works on OpenRouter anyway.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip() or (
+    os.environ.get("LLM_API_KEY", "").strip() if os.environ.get("LLM_API_KEY", "").strip().startswith("sk-or-") else "")
+if OPENROUTER_API_KEY:
+    LLM_BASE_URL = "https://openrouter.ai/api/v1"
+    LLM_API_KEY = OPENROUTER_API_KEY
+    _models = os.environ.get("OPENROUTER_MODEL") or "anthropic/claude-haiku-5.5,openai/gpt-6-luna"
+    LLM_REASONING = os.environ.get("OPENROUTER_REASONING_EFFORT", "")
+else:
+    LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
+    LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+    _models = os.environ.get("LLM_MODEL") or "gemini-3.6-flash,gemini-3.5-flash,gemini-3.8-flash"
+    LLM_REASONING = os.environ.get("LLM_REASONING_EFFORT", "")  # e.g. low / medium; empty = provider default
+# The model list is a preference order; LLM_FALLBACK_MODELS is appended. When a model answers 404 (retired),
+# 429 (quota) or 5xx (overloaded) the next one is tried instead of falling back to keywords.
 LLM_MODELS = list(dict.fromkeys(
-    m.strip() for m in f'{os.environ.get("LLM_MODEL") or DEFAULT_MODELS},{os.environ.get("LLM_FALLBACK_MODELS", "")}'
-    .split(",") if m.strip()))
-LLM_REASONING = os.environ.get("LLM_REASONING_EFFORT", "")  # e.g. low / medium; empty = provider default
-LLM_CHUNK = int(os.environ.get("LLM_CHUNK", "6"))
-LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "4"))
+    m.strip() for m in f'{_models},{os.environ.get("LLM_FALLBACK_MODELS", "")}'.split(",") if m.strip()))
+LLM_CHUNK = int(os.environ.get("LLM_CHUNK", "4"))
+# Round-robin over models only where each model has its own small per-minute budget (Groq free tier).
+SPREAD = os.environ.get("LLM_SPREAD", "auto").lower() in ("1", "true", "on") or (
+    os.environ.get("LLM_SPREAD", "auto").lower() == "auto" and "groq.com" in LLM_BASE_URL)
+LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "16"))
 KEEP_BRACKETS = os.environ.get("EVIDENCE_REF_BRACKETS", "false").lower() == "true"
 AUDIT_MAX_PACKAGES = int(os.environ.get("AUDIT_MAX_PACKAGES", "8"))  # batches this small get model priority
 WARM_BUDGET_S = float(os.environ.get("WARM_BUDGET_S", "240"))
 SETTLE_GUARD = os.environ.get("SETTLE_GUARD", "on").lower() != "off"
+CACHEABLE = ("model", "guard", "noise-guard")  # deterministic results of a model answer; fallbacks are retried
 
 REF_RE = re.compile(r"\[([^\[\]\n]{1,120})\]")
 ID_KEY_RE = re.compile(r"^(id|ref|evidenceid|evidenceref|refid|docid|documentid|recordid|sourceid)$", re.I)
@@ -47,6 +60,7 @@ _cooldown: dict[str, float] = {}  # model -> loop time until which it is skipped
 MODEL_STATUS: dict[str, dict] = {}  # model -> last outcome (no secrets), shown on /healthz
 _warming: set = set()  # cache keys being decided in the background after a fallback
 _no_reasoning: set = set()  # models that rejected reasoning_effort
+_param_fixes: dict[str, set] = {}  # model -> request parameters it rejected (dropped, or max_tokens renamed)
 # Free tiers are limited per model per minute (Groq: 8K tokens/min), so calls are spread round-robin over all
 # ready models, and when every model is cooling down the waiters are served by level:
 # 0 = small (audit) batch, 1 = core batch, 2 = background cache warming.
@@ -135,14 +149,39 @@ def string_leaves(obj):
             yield from string_leaves(v)
 
 
+LABEL_KEY_RE = re.compile(r"^(title|name|type|kind|section|heading|label|category|doc_?type|document_?type|status|"
+                          r"classification|role|purpose)$", re.I)
+
+
+def labeled_lines(obj, label: str = ""):
+    """(label, line) for every non-empty text line. The label carries the enclosing document's title/type/status,
+    so a paragraph inside a document titled "Archive" or "Cover sheet" is recognised as noise even when its own
+    text does not say so."""
+    if isinstance(obj, str):
+        for line in re.split(r"\n+", obj):
+            if line.strip():
+                yield label, line
+    elif isinstance(obj, dict):
+        own = " ".join(v for k, v in obj.items() if isinstance(v, str) and LABEL_KEY_RE.match(k) and len(v) <= 80)
+        inner = f"{label} {own}".strip()
+        for k, v in obj.items():
+            yield from labeled_lines(v, label if LABEL_KEY_RE.match(k) else inner)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from labeled_lines(v, label)
+
+
+def with_label(label: str, line: str) -> str:
+    return f"{label} | {line}" if label else line
+
+
 def paragraphs(pkg: dict):
-    """All text paragraphs that carry bracketed refs, as (text, [refs in order])."""
+    """All text paragraphs that carry bracketed refs, as (label | text, [refs in order])."""
     out = []
-    for s in string_leaves(pkg):
-        for para in re.split(r"\n+", s):
-            refs = [r.strip() for r in REF_RE.findall(para)]
-            if refs:
-                out.append((para, list(dict.fromkeys(refs))))
+    for label, para in labeled_lines(pkg):
+        refs = [r.strip() for r in REF_RE.findall(para)]
+        if refs:
+            out.append((with_label(label, para), list(dict.fromkeys(refs))))
     return out
 
 
@@ -203,17 +242,25 @@ def cites_only_noise(pkg: dict, refs: list) -> bool:
     return bool(refs)
 
 
+NOT_CLAIM_RE = re.compile(r"archiv|example|training|sample|histor|prior|previous|payment|remittance|ledger|decoy|"
+                          r"template|superseded|related|other", re.I)
+
+
 def find_key(obj, names):
-    """Breadth-first search for the shallowest key with one of the given names."""
+    """Breadth-first search for the shallowest key with one of the given names, skipping sub-records that describe
+    something other than the claimed invoice (prior payments, archive examples, ...)."""
     queue = [obj]
     while queue:
         nxt = []
         for o in queue:
             if isinstance(o, dict):
+                labels = " ".join(v for k, v in o.items() if isinstance(v, str) and LABEL_KEY_RE.match(k))
+                if o is not obj and NOT_CLAIM_RE.search(labels):
+                    continue
                 for k, v in o.items():
                     if k in names and not isinstance(v, (dict, list)) and v not in (None, ""):
                         return v
-                nxt.extend(v for v in o.values() if isinstance(v, (dict, list)))
+                nxt.extend(v for k, v in o.items() if isinstance(v, (dict, list)) and not NOT_CLAIM_RE.search(k))
             elif isinstance(o, list):
                 nxt.extend(v for v in o if isinstance(v, (dict, list)))
         queue = nxt
@@ -319,7 +366,8 @@ def finalize(pkg: dict, d: dict) -> dict:
 
 # --- heuristic fallback (used only if every model is unavailable) ------------------------
 NOISE = re.compile(r"archiv|example|training|sample|illustrat|cover sheet|transmittal|historical|template|superseded|decoy", re.I)
-NEGATION = re.compile(r"\b(not|never|without|nor)\b|\bno\b(?!\.)", re.I)  # "Invoice No." is not a negation
+# "Invoice No." is not a negation; "Nothing is pending" / "isn't" / "no longer" are.
+NEGATION = re.compile(r"\b(not|never|without|nor|nothing|none|neither|cannot)\b|n't\b|\bno\b(?!\.)", re.I)
 CUES = [
     ("reject_duplicate", re.compile(r"already (been )?paid|duplicate of|paid (on|under|via)", re.I)),
     ("open_exception", re.compile(r"mismatch|conflict|discrepan|does not match|differs", re.I)),
@@ -362,7 +410,7 @@ def risk_signal(pkg: dict, invoice_number: str = ""):
     """(action, refs, text) for the first live, non-negated, unresolved risk cue anywhere in the package's
     non-noise text (any paragraph, not only 3-ref ones), checked in severity order; None if there is none.
     A 'paid' record that names other invoices but not this one is not a duplicate signal."""
-    lines = [p for s in string_leaves(pkg) for p in re.split(r"\n+", s) if p.strip() and not NOISE.search(p)]
+    lines = [p for p in (with_label(lb, ln) for lb, ln in labeled_lines(pkg)) if not NOISE.search(p)]
     for action, cue in CUES[:-1]:
         for text in lines:
             if action == "reject_duplicate" and invoice_number and invoice_number.lower() not in text.lower() \
@@ -381,7 +429,8 @@ def heuristic_facts(pkg: dict) -> dict:
     text = "\n".join(string_leaves(pkg))
     grab = lambda pat: (re.search(pat, text, re.I) or [None, None])[1]
     amount = re.search(r"\b([A-Z]{3})\s*([\d,]+(?:\.\d+)?)", text)
-    return {"vendorName": (grab(r"vendor(?: name)?\s*[:\-]\s*([^\n.;]+)") or "").strip(),
+    return {"vendorName": (grab(r"(?:vendor(?: name)?\s*[:\-]\s*|invoice from\s+|supplier\s*[:\-]\s*)"
+                                r"([^\n;,]+?)(?=\.\s|\.$|[\n;,]|$)") or "").strip(),
             "invoiceNumber": (grab(r"invoice[ \t]*(?:no\.?|number|#)?[ \t]*[:\-]?[ \t]*"
                                    r"((?=[A-Z0-9\-/]*\d)[A-Z0-9][A-Z0-9\-/]{2,})") or "").strip(),
             "currency": amount[1] if amount else "", "amountText": amount[2] if amount else None}
@@ -436,7 +485,10 @@ def max_tokens_for(n: int):
         return None
     # Groq counts the reserved max_tokens against the per-minute budget, so reserve only what replies use
     # (measured: ~150-250 output tokens per package at reasoning_effort=low).
-    return int(raw) if raw else min(16000, 800 + 300 * n)
+    # Elsewhere reasoning models (gpt-5*, o*) spend part of this budget thinking, so leave more headroom.
+    if raw:
+        return int(raw)
+    return min(16000, 800 + 300 * n) if "groq.com" in LLM_BASE_URL else min(32000, 3000 + 800 * n)
 
 
 def build_payload(packages: list, policy, json_mode: bool = True, reasoning: bool = True) -> dict:
@@ -452,6 +504,28 @@ def build_payload(packages: list, policy, json_mode: bool = True, reasoning: boo
         payload["reasoning_effort"] = LLM_REASONING
     if max_tokens_for(len(packages)):
         payload["max_tokens"] = max_tokens_for(len(packages))
+    return payload
+
+
+ADAPTABLE = {"max_tokens", "temperature", "response_format", "reasoning_effort"}
+
+
+def learn_rejected_params(model: str, payload: dict, error_text: str) -> bool:
+    """OpenAI-style 400s name the refused parameter, e.g. "Unsupported parameter: 'max_tokens' ... use
+    'max_completion_tokens'" (gpt-5 / o-series) or "Unsupported value: 'temperature' does not support 0".
+    Remember it for this model; True if something new was learned."""
+    named = set(re.findall(r"['\"`]([a-z_]+)['\"`]", error_text)) & ADAPTABLE & set(payload)
+    fixes = _param_fixes.setdefault(model, set())
+    new = named - fixes
+    fixes.update(new)
+    return bool(new)
+
+
+def adapt(payload: dict, model: str) -> dict:
+    for param in _param_fixes.get(model, ()):
+        value = payload.pop(param, None)
+        if param == "max_tokens" and value:
+            payload["max_completion_tokens"] = value
     return payload
 
 
@@ -471,6 +545,8 @@ async def pick_model(level: int, deadline: float) -> str:
             raise TimeoutError("model deadline")
         ready = [m for m in LLM_MODELS if _cooldown.get(m, 0) <= loop.time()]
         if ready and not any(_waiting[:level]):
+            if not SPREAD or (level == LEVEL_AUDIT and LLM_MODELS[0] in ready):
+                return ready[0]  # preference order; unseen audit cases always try the first-listed model first
             _rr += 1
             return ready[_rr % len(ready)]
         if not ready:
@@ -498,7 +574,7 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
             model = await pick_model(level, deadline)
             try:
                 async with _sem:
-                    payload = build_payload(packages, policy, json_mode, model not in _no_reasoning)
+                    payload = adapt(build_payload(packages, policy, json_mode, model not in _no_reasoning), model)
                     r = await client.post(f"{LLM_BASE_URL}/chat/completions", json={**payload, "model": model},
                                           timeout=max(3.0, deadline - loop.time()),
                                           headers={"Authorization": f"Bearer {LLM_API_KEY}"})
@@ -514,6 +590,8 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
                     if kind == "rejected" and "reasoning" in r.text.lower() and model not in _no_reasoning:
                         _no_reasoning.add(model)  # e.g. a model that does not take reasoning_effort=low
                         skip = 0
+                    elif kind == "rejected" and learn_rejected_params(model, payload, r.text):
+                        skip = 0  # retry at once without the parameter the model refused
                     _cooldown[model] = loop.time() + skip
                     raise httpx.HTTPStatusError(f"HTTP {r.status_code} {kind}: {clean(r.text, 160)}",
                                                 request=r.request, response=r)
@@ -580,7 +658,7 @@ async def decide_packages(packages: list, deadline: float, store, policy=None) -
             d = raw.get(str(package_id(pkg)))
             if answered(d):
                 final = finalize(pkg, d)
-                if final["source"] == "model":
+                if final["source"] in CACHEABLE:
                     store.put_decision(key, final)  # only fully model-backed decisions are cached
             else:
                 print(f"[decide] FALLBACK used for package {package_id(pkg)}", flush=True)
@@ -645,7 +723,7 @@ async def warm(items: list, policy, store):
                 d = raw.get(str(package_id(pkg)))
                 if answered(d):
                     final = finalize(pkg, d)
-                    if final["source"] == "model":
+                    if final["source"] in CACHEABLE:
                         store.put_decision(key, final)
             print(f"[decide] background cache warm: {sum(answered(raw.get(str(package_id(p)))) for _, _, p in chunk)}"
                   f"/{len(chunk)} decided", flush=True)

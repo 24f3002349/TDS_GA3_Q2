@@ -92,6 +92,21 @@ PKG3 = pkg("Vendor: Zen Paper Co. Invoice ZP-9 for INR 12,000.00.",
 g = decide.finalize(PKG3, {"action": "reject_duplicate", "decisiveRefs": ["PAY-9", "LED-9", "REM-9"]})
 check("real duplicate untouched", g["action"] == "reject_duplicate" and g["source"] == "model", g)
 
+# structured facts come from the claimed invoice, not from prior-payment / archive sub-records
+nested = {"packageId": "F", "priorPayments": [{"invoiceNumber": "OLD-1", "amountMinor": 5}],
+          "claim": {"vendorName": "Acme", "invoiceNumber": "NEW-2", "amountMinor": 4520000, "currency": "INR"}}
+check("facts skip prior payments", decide.build_facts(nested, {}) ==
+      {"vendorName": "Acme", "invoiceNumber": "NEW-2", "amountMinor": 4520000, "currency": "INR"},
+      decide.build_facts(nested, {}))
+# a document titled "Archive" is noise even when its paragraph does not say so
+titled = {"packageId": "T", "documents": [
+    {"title": "Archive", "text": "Invoice T-1 was already paid [A-1] [A-2] [A-3]."},
+    {"title": "Reconciliation", "text": "PO [P-1] and GRN [G-1] match invoice [I-1]; within authority, reconciled."}]}
+g = decide.finalize(titled, {"action": "reject_duplicate", "decisiveRefs": ["A-1", "A-2", "A-3"], "invoiceNumber": "T-1"})
+check("title marks archive as noise", g["action"] == "settle_invoice" and g["evidenceRefs"] == ["P-1", "G-1", "I-1"], g)
+check("'Nothing is pending' is negated", decide.risk_signal(
+    {"documents": [{"text": "All matched. Nothing is pending."}]}) is None)
+
 # error classification: Groq TPM 429 waits only the advertised time; nothing disables a model for a day
 class R:
     def __init__(self, code, text, headers=None):
