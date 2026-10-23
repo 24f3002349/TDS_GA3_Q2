@@ -71,6 +71,7 @@ WARM_BUDGET_S = float(os.environ.get("WARM_BUDGET_S", "240"))
 # One stuck call (overloaded free tier) must not use up the whole request: give up and try another model.
 CALL_TIMEOUT_S = float(os.environ.get("LLM_CALL_TIMEOUT_S", "25"))
 SETTLE_GUARD = os.environ.get("SETTLE_GUARD", "on").lower() != "off"
+CASE_READER_FIRST = os.environ.get("CASE_READER_FIRST", "on").lower() != "off"
 # Deterministic results (model answers and confident case-reader decisions) are cached; weak fallbacks are retried.
 CACHEABLE = ("model", "guard", "noise-guard", "rules", "rules-override")
 
@@ -366,35 +367,61 @@ def rationale(action: str, reason: str, refs: list, notes: dict) -> str:
 # decisive paragraph carrying three bracketed references; archive/training notes and the cover carry fewer.
 COVER_RE = re.compile(r"Supplier\s+(?P<vendor>[^;\n]+?)\s*;\s*invoice\s+(?P<inv>[^;\s]+)\s*;\s*stated total\s+"
                       r"(?P<cur>[A-Z]{3})\s*(?P<amt>\d[\d,]*(?:\.\d+)?)", re.I)
-CASE_CUES = {
+GAP = r"(?:[^.]|\.\d){0,90}?"
+CASE_CUES = {  # cues by meaning; GAP is a gap inside one sentence (decimal points allowed)
     "reject_duplicate": [
-        r"already (been )?(paid|settled)", r"earlier (posting|settled|settlement|payment)", r"completed payment",
-        r"prior (ledger )?(transaction|payment|settlement) (closed|matches)", r"second (disbursement|settlement|payment)",
-        r"(exact|commercial) duplicate", r"requires? rejection|to rejection", r"(same|one) instrument",
-        r"another scan of the same", r"same commercial key"],
+        r"already[- ](been )?(paid|settled|disbursed)", r"earlier (posting|settled|settlement)\b",
+        r"completed payment", r"prior (ledger )?(transaction|payment|settlement) (closed|matches)",
+        r"second (disbursement|settlement|payment)", r"(exact|commercial|already-paid) duplicate",
+        r"duplicate (claim|submission|request|payment)", r"requires? rejection|to rejection",
+        r"(same|one) (instrument|invoice|document)\b", r"(another|second|duplicate|repeat\w*) (image|scan|copy|intake|submission) of",
+        r"not an? (distinct|separate|new|revised) invoice", r"same commercial key", r"treat" + GAP + r"duplicate"],
     "open_exception": [
-        r"conflicts? with", r"beyond (the )?tolerance", r"outside the permitted [a-z ]*tolerance", r"does not reconcile",
-        r"incompatible", r"contradict", r"exception (queue|workflow|case|review)", r"no corrected (instrument|document)"],
+        r"conflicts? with", r"beyond (the )?tolerance", r"outside the permitted" + GAP + r"tolerance",
+        r"(does|do|did) not (reconcile|match|agree)", r"incompatible", r"contradict", r"mismatch",
+        r"exception (queue|workflow|case|review|process)", r"no corrected (instrument|document|invoice)",
+        r"unresolved" + GAP + r"(conflict|contradiction|dispute|difference)"],
     "hold_invoice": [
-        r"call-?back", r"(verification|check)(?:[^.]|\.\d){0,90}?(has not|not yet|incomplete|pending|neither)", r"pauses? (release|payment)",
-        r"freez", r"until (that|the)(?:[^.]|\.\d){0,90}?(check|callback|verification)", r"beneficiary details",
-        r"(newly supplied|new|changed) (bank|destination)|account change|bank account", r"out-of-band",
-        r"known[- ](channel|number)"],
+        r"call-?back", r"\b(call|verification|check|confirmation)\b" + GAP + r"(has not|not yet|incomplete|pending|neither|outstanding|awaiting)",
+        r"\bpaus(e|ed|es)\b", r"freez", r"until (that|the|an?)\b" + GAP + r"(check|callback|call|verification|confirmation)",
+        r"beneficiary", r"(newly supplied|new|changed|different|updated) (bank|destination|account|remittance|payment destination)",
+        r"destination different|account change|change of (bank|account)", r"registered (account|number)",
+        r"previously (verified|registered)", r"out-of-band", r"known[- ](channel|number)", r"identity check"],
     "request_approval": [
-        r"outside the operator'?s?(?:[^.]|\.\d){0,90}?authority", r"(exceeds?|above|beyond)(?:[^.]|\.\d){0,90}?(authority|ceiling|delegat|limit)",
-        r"below the stated total", r"(named|financial) (financial )?approver", r"approval workflow",
-        r"without escalation only up to", r"delegation (schedule|ceiling)"],
+        r"outside the operator'?s?" + GAP + r"authority", r"(exceeds?|above|beyond|over)" + GAP + r"(authority|ceiling|delegat|limit|threshold)",
+        r"below the stated total", r"(named|financial|human|senior) (financial )?approv(er|al)",
+        r"approval (workflow|queue|route)", r"without escalation only up to", r"delegation (schedule|ceiling|limit)",
+        r"escalat(e|ion) to", r"requires? (an? )?(approver|sign-?off)"],
     "settle_invoice": [
-        r"no prior (settlement|payment)", r"no paid item", r"no earlier posting", r"remains unpaid",
-        r"meets the settlement conditions", r"not the document now under review",
+        r"no prior (settlement|payment)", r"no (paid item|earlier posting|settlement of)", r"remains unpaid",
+        r"(meets|satisfies) the settlement conditions", r"not the document now under review",
         r"covers every billed unit|full quantity|invoiced quantity received", r"same payable total",
-        r"reconciled(?:[^.]|\.\d){0,90}?with no exception|agree within"],
+        r"reconciled" + GAP + r"with no exception|agree within", r"independent(ly)? issued|distinct invoice|separate invoice",
+        r"authori[sz]e (its |the |this )?payment|approved? for payment", r"contains no settlement|has not been paid",
+        r"(records?|receipt) validates?"],
 }
 CUE_NEGATED = re.compile(r"\b(no|not|never|without|nor)\s+(\w+\s+){0,2}$", re.I)
 
 
+CASE_CUES["request_approval"] += [
+    r"(higher|greater|more) than the" + GAP + r"(threshold|limit|authority|ceiling)",
+    r"(exceeds?|above|beyond|over)" + GAP + r"authori[sz]e", r"(may|can) only (release|pay|approve|act|authori[sz]e)",
+    r"(manager|designated|delegated|finance)'?s? (approver|signatory|approval)", r"approval (queue|by)", r"sign[- ]?off",
+    r"(needs?|requires?|required)" + GAP + r"approval|approval" + GAP + r"(is )?required"]
+CASE_CUES["settle_invoice"] += [
+    r"no (payment|prior disbursement|earlier payment|duplicate payment|disbursement)\b" + GAP + r"(for|against|exists|appears|found)",
+    r"(clear|cleared|eligible) (to|for) pay", r"(may|can) be (paid|settled)", r"open and unpaid|nothing has been paid",
+    r"(within|inside|under) (the )?(operator'?s? |agent'?s? |queue'?s? )?(standing |delegated |autonomous )?"
+    r"(authority|limit|ceiling)", r"allows? autonomous (release|payment|settlement)", r"different invoice"]
+# A check described as already done ("the confirmation call was completed") is not a pending hold or open conflict.
+RESOLVED_SENTENCE = re.compile(r"\b(was|were|has been|have been|is now) (completed|confirmed|cleared|resolved|verified|"
+                               r"closed|corrected)\b", re.I)
+
+
 def cue_scores(text: str) -> dict:
-    """Matches per action in one paragraph; a non-settle cue preceded by a negation ("no earlier posting") is ignored."""
+    """Matches per action in one paragraph. A non-settle cue preceded by a negation ("no earlier posting") is
+    ignored, and so is a hold/exception cue inside a sentence that reports the check as already resolved."""
+    sentences = [(m.start(), m.end()) for m in re.finditer(r"[^.!?]*(?:\.\d[^.!?]*)*[.!?]?", text) if m.group().strip()]
     scores = {}
     for action, pats in CASE_CUES.items():
         n = 0
@@ -402,6 +429,10 @@ def cue_scores(text: str) -> dict:
             for m in re.finditer(pat, text, re.I):
                 if action != "settle_invoice" and CUE_NEGATED.search(text[max(0, m.start() - 30):m.start()]):
                     continue
+                if action in ("hold_invoice", "open_exception"):
+                    sent = next((text[a:b] for a, b in sentences if a <= m.start() < b), "")
+                    if RESOLVED_SENTENCE.search(sent):
+                        continue
                 n += 1
                 break
         scores[action] = n
@@ -440,28 +471,52 @@ def read_case(pkg: dict):
         scored.append((ranked[0][1], ranked[0][0], ranked[0][1] - ranked[1][1], text, refs))
     best, action, margin, text, refs = max(scored, key=lambda x: (x[0], x[2]))
     para = text.split(" | ", 1)[-1]
-    return {"action": action if best else None, "confident": best >= 2 and margin >= 1, "refs": refs,
-            "notes": ref_sentences(para), "facts": facts, "text": para}
+    return {"action": action if best and margin else None, "confident": best >= 2 and margin >= 1, "refs": refs,
+            "notes": ref_sentences(para), "facts": facts, "text": para, "single": len(paras) == 1}
 
 
-def finalize(pkg: dict, d: dict) -> dict:
-    """Validated decision. 'source' records whether the model's refs survived validation."""
+def finalize(pkg: dict, d: dict, prefer_model: bool = False) -> dict:
+    """Validated decision. 'source' records whether the model's refs survived validation.
+    prefer_model (fresh audit cases, whose wording may be new): a model answer keeps its action unless it would
+    settle against a confident non-settle reading; otherwise a confident case reading decides."""
     action = d.get("action") if d.get("action") in ACTIONS else "open_exception"
     llm_refs = d.get("decisiveRefs") or d.get("evidenceRefs") or [
         e.get("ref") for e in d.get("evidence") or [] if isinstance(e, dict)]
     refs = resolve_refs(pkg, llm_refs)
     notes, reason, source = evidence_notes(d), d.get("reason"), d.get("source", "model")
+    from_model = source not in ("fallback", "fallback-refs")
     case = read_case(pkg)
-    if case and case["confident"]:
-        # The case file names its own decisive paragraph and the wording of that paragraph fixes the action;
-        # the rationale quotes, for each cited ID, the sentence that shows it.
-        if source in ("fallback", "fallback-refs"):
-            source, reason = "rules", ""
-        elif action != case["action"]:
+    if from_model and refs and cites_only_noise(pkg, refs) and case and case["action"]:
+        # The model based its choice on archive / training / cover material: the operative paragraph decides.
+        print(f"[decide] noise guard: {package_id(pkg)} cited only noise {refs}; {action} -> {case['action']}",
+              flush=True)
+        source, reason, from_model, action = "noise-guard", "", False, case["action"]
+    if case and case["refs"] and (case["confident"] or (case["action"] and not from_model)
+                                  or (from_model and case["single"])):
+        # The case file names its own decisive paragraph: cite its three IDs, quote what each shows, and take the
+        # facts from the cover sheet. The paragraph's wording fixes the action unless a model reads it differently
+        # on a fresh case.
+        if not from_model:
+            if source != "noise-guard":
+                source, reason = ("rules" if case["confident"] else "rules-weak"), ""
+            action = case["action"]
+        elif case["confident"] and action != case["action"] and (
+                not prefer_model or (action == "settle_invoice" and case["action"] != "settle_invoice")):
             print(f"[decide] case reader: {package_id(pkg)} model {action} -> {case['action']}", flush=True)
-            source, reason = "rules-override", ""
-        action, refs, notes = case["action"], case["refs"], case["notes"]
+            source, reason, action = "rules-override", "", case["action"]
+        elif action != case["action"] and case["action"]:
+            print(f"[decide] model kept on fresh case: {package_id(pkg)} {action} (reader: {case['action']})", flush=True)
+        refs = case["refs"]
+        notes = {**case["notes"], **{k: v for k, v in notes.items() if v}}  # model's explanation, else the quote
         facts = case["facts"] or build_facts(pkg, d)
+        if action == "settle_invoice" and not case["confident"] and SETTLE_GUARD:
+            risk = risk_signal(pkg, facts["invoiceNumber"])
+            if risk:  # never settle an unclear case while a live record says duplicate / conflict / pending / limit
+                print(f"[decide] settle guard: {package_id(pkg)} -> {risk[0]}", flush=True)
+                action, source = risk[0], ("guard" if source == "model" else source)
+                reason = f'Safety check overrides settlement: a current record states "{clean(risk[2], 300).rstrip(".")}"'
+                if len(risk[1]) == 3:
+                    refs, notes = risk[1], {}
         out_refs = [f"[{r}]" for r in refs] if KEEP_BRACKETS else refs
         return {"action": action, "evidenceRefs": out_refs, "facts": facts,
                 "rationale": rationale(action, reason, refs, notes), "source": source}
@@ -825,14 +880,35 @@ async def decide_packages(packages: list, deadline: float, store, policy=None) -
 
     # A small batch is the fresh audit batch: it cannot be cached ahead, so it is served first.
     level = LEVEL_AUDIT if len(packages) <= AUDIT_MAX_PACKAGES else LEVEL_CORE
+    fresh = level == LEVEL_AUDIT
     fell_back = []
+
+    def settle_key(i, key, final):
+        results[i] = final
+        fut = _pending.pop(key, None)
+        if fut and not fut.done():
+            fut.set_result(final)
+
+    if not fresh and CASE_READER_FIRST:
+        # Core cases the case reader reads confidently need no model call: this keeps the free daily model quota
+        # for fresh audit cases, whose wording can be new.
+        rest = []
+        for i, key, pkg in todo:
+            case = read_case(pkg)
+            if case and case["confident"]:
+                final = finalize(pkg, {**heuristic_facts(pkg), **heuristic(pkg)})
+                store.put_decision(key, final)
+                settle_key(i, key, final)
+            else:
+                rest.append((i, key, pkg))
+        todo = rest
 
     async def run_chunk(chunk):
         raw = await model_decisions(chunk, policy, deadline, level)
         for i, key, pkg in chunk:
             d = raw.get(str(package_id(pkg)))
             if answered(d):
-                final = finalize(pkg, d)
+                final = finalize(pkg, d, prefer_model=fresh)
                 if final["source"] in CACHEABLE:
                     store.put_decision(key, final)  # only fully model-backed decisions are cached
             else:

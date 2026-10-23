@@ -40,9 +40,9 @@ check("rationale cites every ref", all(f"[{r}]" in d["rationale"] for r in d["ev
 check("rationale explains", "call-back is still pending" in d["rationale"] and 60 <= len(d["rationale"]) <= 1500)
 check("amount minor", d["facts"]["amountMinor"] == 1200000, d["facts"])
 bad = decide.finalize(PKG, {"action": "hold_invoice", "decisiveRefs": ["NOPE-1"], "reason": "x"})
-check("invalid refs replaced from package", bad["evidenceRefs"] == ["BNK-4", "INV-4471", "CTL-9"]
-      and bad["source"] == "fallback-refs", bad)
-check("unknown action -> open_exception", decide.finalize(PKG, {"action": "pay"})["action"] == "open_exception")
+check("invalid refs replaced by the decisive paragraph", bad["evidenceRefs"] == ["BNK-4", "INV-4471", "CTL-9"], bad)
+check("unknown action -> case reader decides (never settle)",
+      decide.finalize(PKG, {"action": "pay"})["action"] == "hold_invoice")
 check("batch context drops packages/batchId",
       decide.batch_context({"batchId": "B", "packages": [], "policyRevision": "R"}) == {"policyRevision": "R"})
 
