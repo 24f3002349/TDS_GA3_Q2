@@ -463,6 +463,11 @@ def read_case(pkg: dict):
                  "amountMinor": to_minor(cover["amt"], cur), "currency": cur}
     paras = [(t, r) for t, r in paragraphs(pkg) if len(r) == 3 and not NOISE.search(t)]
     if not paras:
+        records = read_records(pkg)
+        if records:
+            if facts:
+                records["facts"] = {**records["facts"], **{k: v for k, v in facts.items() if v}}
+            return records
         return {"action": None, "confident": False, "refs": [], "notes": {}, "facts": facts, "text": ""}
     scored = []
     for text, refs in paras:
@@ -473,6 +478,109 @@ def read_case(pkg: dict):
     para = text.split(" | ", 1)[-1]
     return {"action": action if best and margin else None, "confident": best >= 2 and margin >= 1, "refs": refs,
             "notes": ref_sentences(para), "facts": facts, "text": para, "single": len(paras) == 1}
+
+
+# --- record reader: case files where every record carries one reference and the decision combines records ---------
+# e.g. "[R_..] Payment ledger: a disbursement for USD 1.00 to X previously settled order PO-1. The currently submitted
+# order is PO-2." / "[R_..] Order PO-2 is signed for USD 1.00 ... submitted invoice total is USD 1.00." /
+# "[R_..] Vendor master lists account AC-1. Remittance instructions now specify AC-1. The callback ... is confirmed ...
+# Approved autonomous payment ceiling for USD is USD 2.00." Decoy records (archive, training, closed incidents for
+# other suppliers, expired delegations, unrelated orders) are dropped; the live records are the evidence.
+RECORD_NOISE = re.compile(
+    r"archiv|training|example|historical|template|superseded|decoy|\bclosed\b[^.]*\b(incident|case)\b|separate supplier|"
+    r"\bunrelated\b|\bexpired\b|previous quarter|govern no live case|no current-order identifier|does not refer to", re.I)
+AMOUNT = r"([A-Z]{3})\s?(\d[\d,]*(?:\.\d+)?)"
+RULE_TEXT = re.compile(r"\bcontrols?:|\bpolicy\b|\bdo not\b|\bmust not\b|\brequires? the\b|\botherwise follow\b", re.I)
+
+
+def money(cur, num):
+    return cur.upper(), to_minor(num, cur.upper())
+
+
+def read_records(pkg: dict):
+    records = []  # (ref, text) in document order
+    for _, line in labeled_lines(pkg):
+        refs = [r.strip() for r in REF_RE.findall(line)]
+        if len(refs) == 1:
+            records.append((refs[0], REF_RE.sub("", line).strip()))
+    live = [(r, t) for r, t in records if not RECORD_NOISE.search(t)]
+    if len(records) < 4 or not 2 <= len(live) <= 5:
+        return None
+    text = " ".join(t for _, t in live)
+    reasons = {}  # action -> ref of the record that triggers it
+
+    def first(pattern, flags=re.I):
+        """First factual sentence (policy sentences such as "Payment controls: do not pay ..." are skipped)."""
+        for r, t in live:
+            for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z])", t):
+                if RULE_TEXT.search(sentence) and not re.search(r"\d", sentence):
+                    continue
+                m = re.search(pattern, sentence, flags)
+                if m:
+                    return r, m
+        return None, None
+
+    # facts
+    _, inv = first(r"\b(INV-[\w-]*\d)")
+    _, ven = first(r"\bto ([A-Z][\w&.,' -]+?) (?:previously|for|on|under)\b|\bSupplier ([A-Z][^;.\n]+)", 0)
+    _, total = first(r"invoice total (?:is|of)\s+" + AMOUNT)
+    _, signed = first(r"signed for\s+" + AMOUNT)
+    _, instr = first(r"instrument\b[^.]*?\band\s+" + AMOUNT)
+    _, paid = first(r"disbursement for\s+" + AMOUNT)
+    claim = total or instr or signed or paid
+    cur, amount = money(claim[1], claim[2]) if claim else ("", 0)
+    facts = {"vendorName": ((ven[1] or ven[2]).strip() if ven else ""), "invoiceNumber": inv[1] if inv else "",
+             "amountMinor": amount or 0, "currency": cur}
+
+    # duplicate: the ledger already settled the order (or invoice) now submitted
+    r_led, led = first(r"(?:settled|paid|discharged|closed)\s+(?:order\s+)?(PO-[\w-]+)")
+    _, cur_order = first(r"currently submitted order is (PO-[\w-]+)")
+    _, ins_order = first(r"covers order (PO-[\w-]+)")
+    submitted = (cur_order or ins_order)
+    if led and submitted and led[1].rstrip(".") == submitted[1].rstrip("."):
+        reasons["reject_duplicate"] = r_led
+    for r, t in live:  # a factual "already paid" statement (not a policy rule such as "do not pay ... already paid")
+        if RULE_TEXT.search(t):
+            continue
+        if re.search(r"already (been )?(paid|settled|discharged)|second (payment|disbursement)", t, re.I) and \
+                not re.search(r"(not|never) (been )?(paid|settled)", t, re.I):
+            reasons.setdefault("reject_duplicate", r_led or r)
+    # exception: material order/invoice difference or an unresolved dispute
+    r_sig, _ = first(r"signed for\s+" + AMOUNT)
+    if signed and total and money(signed[1], signed[2]) != money(total[1], total[2]):
+        reasons["open_exception"] = r_sig
+    r_dis, dis = first(r"(has not|not yet|never) (been )?resolved[^.]*dispute|dispute[^.]*(unresolved|remains open|open)|"
+                       r"(conflict|mismatch|contradict)")
+    if dis:
+        reasons.setdefault("open_exception", r_dis)
+    # hold: bank details changed and the independent confirmation is not complete
+    r_bank, master = first(r"(?:master|registered)[^.]*account (AC-[\w-]+)")
+    _, remit = first(r"(?:remittance|payment) instructions? (?:now )?(?:specif\w+|name|list\w*|use\w*) (AC-[\w-]+)")
+    _, cb_ok = first(r"(call-?back|confirmation|verification)[^.]*\b(is|was|has been) (confirmed|completed|verified)")
+    _, cb_open = first(r"(call-?back|confirmation|verification)[^.]*(pending|not (yet )?(been )?(confirmed|completed|returned|"
+                       r"received)|awaiting|outstanding|unanswered|has not)")
+    if master and remit and master[1] != remit[1] and (cb_open or not cb_ok):
+        reasons["hold_invoice"] = r_bank
+    elif cb_open and not cb_ok:
+        reasons["hold_invoice"] = r_bank or first(r"call-?back")[0]
+    # approval: payable total above the autonomous ceiling
+    r_ceil, ceil = first(r"(?:ceiling|limit|threshold|authority)\b[^.]*?\bis\s+" + AMOUNT)
+    if ceil and claim:
+        c_cur, c_amt = money(ceil[1], ceil[2])
+        if c_cur == cur and amount > c_amt:
+            reasons["request_approval"] = r_ceil
+    action = next((a for a in ("reject_duplicate", "open_exception", "hold_invoice", "request_approval")
+                   if a in reasons), "settle_invoice")
+    known = bool(claim) and (bool(led) or bool(signed) or bool(ceil) or bool(master))
+    confident = action != "settle_invoice" or (known and bool(signed or instr) and (bool(led) or bool(ceil)))
+    # evidence: the live records (three when the file has three); prefer the triggering record if there are more
+    chosen = [r for r, _ in live]
+    if len(chosen) > 3:
+        keep = {reasons.get(action)} | {r for r, t in live if re.search(r"ledger|order|ceiling|controls", t, re.I)}
+        chosen = [r for r in chosen if r in keep][:3] or chosen[:3]
+    notes = {r.lower(): clean(t, 260).rstrip(" .") for r, t in live if r in chosen}
+    return {"action": action, "confident": confident, "refs": chosen, "notes": notes, "facts": facts,
+            "text": text, "single": True, "exact": confident}
 
 
 def finalize(pkg: dict, d: dict, prefer_model: bool = False) -> dict:
@@ -501,7 +609,8 @@ def finalize(pkg: dict, d: dict, prefer_model: bool = False) -> dict:
                 source, reason = ("rules" if case["confident"] else "rules-weak"), ""
             action = case["action"]
         elif case["confident"] and action != case["action"] and (
-                not prefer_model or (action == "settle_invoice" and case["action"] != "settle_invoice")):
+                not prefer_model or case.get("exact")
+                or (action == "settle_invoice" and case["action"] != "settle_invoice")):
             print(f"[decide] case reader: {package_id(pkg)} model {action} -> {case['action']}", flush=True)
             source, reason, action = "rules-override", "", case["action"]
         elif action != case["action"] and case["action"]:
@@ -590,7 +699,7 @@ def heuristic(pkg: dict) -> dict:
                       "or held invoice, so the records need exception review"}
 
 
-RESOLVED = re.compile(r"\b(completed|cleared|resolved|released|lifted|satisfied|verified|passed|withdrawn|closed|"
+RESOLVED = re.compile(r"\b(completed|cleared|resolved|released|lifted|satisfied|verified|confirmed|passed|withdrawn|closed|"
                       r"reversed|refunded|voided|cancell?ed)\b", re.I)
 
 
@@ -754,7 +863,7 @@ def note(model: str, ok: bool, detail: str):
     MODEL_STATUS[model] = {"ok": ok, "detail": clean(detail, 300), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
-async def pick_model(level: int, deadline: float) -> str:
+async def pick_model(level: int, deadline: float, hedge: int = 0) -> str:
     """Next ready model (round-robin). While every model cools down, wait if one frees up before the deadline;
     lower levels go first when a model frees up."""
     global _rr
@@ -769,8 +878,10 @@ async def pick_model(level: int, deadline: float) -> str:
         if any(m not in LAST_RESORT and 0 < _cooldown.get(m, 0) - now <= 4 for m in LLM_MODELS):
             ready = [m for m in ready if m not in LAST_RESORT]
         if ready and not any(_waiting[:level]):
-            if not SPREAD or (level == LEVEL_AUDIT and LLM_MODELS[0] in ready):
-                return ready[0]  # preference order; unseen audit cases always try the first-listed model first
+            if level == LEVEL_AUDIT:
+                return ready[hedge % len(ready)]  # hedged audit calls start on different models
+            if not SPREAD:
+                return ready[0]  # preference order
             pool = [m for m in ready if m in LLM_MODELS[:SPREAD_TOP]] or ready
             _rr += 1
             return pool[_rr % len(pool)]
@@ -790,7 +901,7 @@ async def pick_model(level: int, deadline: float) -> str:
             _waiting[level] -= 1
 
 
-async def call_model(packages: list, policy, deadline: float, level: int = LEVEL_CORE) -> dict:
+async def call_model(packages: list, policy, deadline: float, level: int = LEVEL_CORE, hedge: int = 0) -> dict:
     global _sem
     _sem = _sem or asyncio.Semaphore(LLM_CONCURRENCY)
     json_mode = True
@@ -799,13 +910,14 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
         attempt = 0
         while True:  # ends on success, after 8 real failures, or at the deadline (pick_model raises)
             attempt += 1
-            model = await pick_model(level, deadline)
+            model = await pick_model(level, deadline, hedge)
             try:
                 base, key, extra = ENDPOINT.get(model, (LLM_BASE_URL, LLM_API_KEY, {}))
                 async with _sem:
                     payload = adapt(build_payload(packages, policy, json_mode, model not in _no_reasoning, base), model)
                     r = await client.post(f"{base}/chat/completions", json={**payload, **extra, "model": model},
-                                          timeout=max(3.0, min(deadline - loop.time(), CALL_TIMEOUT_S)),
+                                          timeout=max(3.0, min(deadline - loop.time(), CALL_TIMEOUT_S,
+                                                               10 + 1.5 * len(packages))),
                                           headers={"Authorization": f"Bearer {key}"})
                 if r.status_code >= 400:
                     kind, skip = classify(r)
@@ -842,10 +954,10 @@ async def call_model(packages: list, policy, deadline: float, level: int = LEVEL
                     raise
 
 
-async def ask_model(packages: list, policy, deadline: float, level: int = LEVEL_CORE) -> dict:
+async def ask_model(packages: list, policy, deadline: float, level: int = LEVEL_CORE, hedge: int = 0) -> dict:
     """call_model, halving the batch whenever the provider says the request is too large."""
     try:
-        return await call_model(packages, policy, deadline, level)
+        return await call_model(packages, policy, deadline, level, hedge)
     except TooLarge as e:
         print(f"[decide] {e}; splitting", flush=True)
         if len(packages) == 1:
@@ -945,6 +1057,32 @@ def answered(d) -> bool:
     return isinstance(d, dict) and d.get("action") in ACTIONS
 
 
+async def hedged(packages: list, policy, deadline: float) -> dict:
+    """Fresh audit cases: ask two models at once (free tiers return 503 or stall under load) and use the first
+    complete answer; the slower call is cancelled."""
+    if len(LLM_MODELS) < 2:
+        return await ask_model(packages, policy, deadline, LEVEL_AUDIT)
+    tasks = [asyncio.ensure_future(ask_model(packages, policy, deadline, LEVEL_AUDIT, h)) for h in (0, 1)]
+    best: dict = {}
+    try:
+        for fut in asyncio.as_completed(tasks):
+            try:
+                out = await fut
+            except Exception as e:
+                print(f"[decide] hedged call failed: {type(e).__name__}: {str(e)[:150]}", flush=True)
+                continue
+            if sum(map(answered, out.values())) > sum(map(answered, best.values())):
+                best = out
+            if sum(map(answered, best.values())) >= len(packages):
+                break
+    finally:
+        for t in tasks:
+            t.cancel()
+    if not best:
+        raise RuntimeError("no hedged model answered")
+    return best
+
+
 async def model_decisions(chunk: list, policy, deadline: float, level: int) -> dict:
     """Raw model decisions keyed by packageId; one extra call for packages the model skipped, if time allows."""
     raw, missing = {}, list(chunk)
@@ -953,7 +1091,9 @@ async def model_decisions(chunk: list, policy, deadline: float, level: int) -> d
         if not LLM_API_KEY or not missing:
             break
         try:
-            raw.update(await ask_model([p for _, _, p in missing], policy, deadline, level))
+            pkgs = [p for _, _, p in missing]
+            raw.update(await (hedged(pkgs, policy, deadline) if level == LEVEL_AUDIT
+                              else ask_model(pkgs, policy, deadline, level)))
         except Exception as e:
             print(f"[decide] model failed for chunk: {type(e).__name__}: {str(e)[:300]}", flush=True)
             break
