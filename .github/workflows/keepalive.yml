@@ -1,0 +1,22 @@
+# Render's free plan stops the service after 15 idle minutes, and waking it takes longer than the grader waits.
+# Pinging /healthz every 10 minutes keeps it awake. GitHub may delay scheduled runs, so open /healthz yourself
+# right before a Check or Save as well.
+name: keep-alive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /healthz (retries cover a cold start)
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS -m 60 https://tds-ga3-q2-kk91.onrender.com/healthz; then exit 0; fi
+            sleep 15
+          done
+          exit 1
